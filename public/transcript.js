@@ -15,6 +15,14 @@ let mediaRecorder = null;
 let segmentTimer = null;
 let transcriptionQueue = Promise.resolve();
 let finishCloudRecording = null;
+let uiLanguage = "zh";
+let audioContext = null;
+let analyser = null;
+let meterFrame = null;
+let detectedSound = false;
+let soundWatchdog = null;
+let recognitionWatchdog = null;
+let micTestUrl = "";
 
 const config = {
   key: "",
@@ -103,11 +111,211 @@ function supportsCloudRecording() {
   return Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
 }
 
+function t(chinese, english) {
+  return uiLanguage === "zh" ? chinese : english;
+}
+
+function setText(selector, chinese, english) {
+  const element = $(selector);
+  if (element) element.textContent = t(chinese, english);
+}
+
+function setDirectText(selector, chinese, english) {
+  const element = $(selector);
+  if (!element) return;
+  const textNode = Array.from(element.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+  if (textNode) textNode.textContent = t(chinese, english);
+}
+
+function applyUiLanguage() {
+  document.documentElement.lang = uiLanguage === "zh" ? "zh-CN" : "en";
+  $("#uiLangBtn").textContent = uiLanguage === "zh" ? "English" : "中文";
+  setDirectText(".nav button.active", "实时转写", "Live transcript");
+  setDirectText("#historyBtn", "最近记录", "Recent sessions");
+  setText(".privacy", "隐私设置", "Privacy");
+  setText(".title h1", "实时转写", "Live transcript");
+  setText(".title p", "让每一句话都清楚、准确、有上下文。", "Clear, accurate, contextual notes from every conversation.");
+  $("#providerBadge").textContent = speechConfig.key ? `${speechProviders[speechConfig.provider].name}${config.key ? ` · ${providers[config.provider].name}` : ""}` : t("模型设置", "Model settings");
+  if (!recording) {
+    setText("#statusText", lines.length ? "转写已完成" : "准备就绪", lines.length ? "Transcription complete" : "Ready");
+    setText("#statusSub", lines.length ? `共记录 ${lines.length} 段内容` : (supportsNativeRecognition() ? "点击开始，允许麦克风访问" : "当前浏览器需配置云端语音识别"), lines.length ? `${lines.length} segments captured` : (supportsNativeRecognition() ? "Press start and allow microphone access" : "Cloud speech recognition is required in this browser"));
+  }
+  $("#sourceLang").options[0].text = t("中文", "Chinese");
+  $("#sourceLang").options[1].text = "English";
+  $("#targetLang").options[0].text = "English";
+  $("#targetLang").options[1].text = t("中文", "Chinese");
+  $("#targetLang").options[2].text = t("不翻译", "Off");
+  setText(".auto", "AI 自动纠错与标点", "AI punctuation and cleanup");
+  setText(".micbar label", "麦克风", "Microphone");
+  setText("#testMicBtn", "测试 3 秒", "Test 3 sec");
+  if (!$("#micResult").classList.contains("ok") && !$("#micResult").classList.contains("warn")) setText("#micResult", "等待测试", "Not tested");
+  setText(".speakerbar-label", "说话人区分", "Speakers");
+  setText(".speaker-state", "手动标记", "Manual labels");
+  document.querySelectorAll("[data-speaker]").forEach((button) => { button.textContent = `${t("说话人", "Speaker")} ${button.dataset.speaker}`; });
+  setText("#addSpeaker", "＋ 添加", "+ Add");
+  setText(".speakerhelp", "录音时点按切换", "Tap to switch while recording");
+  if (!recording) setText("#recordLabel", lines.length ? "继续录音" : "开始录音", lines.length ? "Record again" : "Start recording");
+  setText("#demoBtn", "体验演示", "Try demo");
+  setText(".summary .eyebrow", "AI 摘要", "AI summary");
+  if (!lines.length) {
+    setText("#summaryTitle", "录音结束后生成", "Generated after recording");
+    setText("#summaryText", "将自动提炼核心结论、关键决定和下一步行动。", "Extract key conclusions, decisions, and next steps automatically.");
+  }
+  setText(".detail .eyebrow", "会话洞察", "Session insights");
+  const insights = document.querySelectorAll(".detail .insight");
+  if (insights[0]) { insights[0].querySelector("strong").textContent = t("说话人区分", "Speaker labels"); insights[0].querySelector("p").textContent = t("区分不同发言人，并可点按标签快速校正。", "Label speakers and tap any label to correct it quickly."); }
+  if (insights[1]) { insights[1].querySelector("strong").textContent = t("实时翻译", "Live translation"); insights[1].querySelector("p").textContent = t("原文与译文同步对照，适合访谈与跨国会议。", "View source and translation together for interviews and global meetings."); }
+  if (insights[2]) { insights[2].querySelector("strong").textContent = t("结构化总结", "Structured summary"); insights[2].querySelector("p").textContent = t("按发言人提取摘要、决定与待办事项。", "Extract summaries, decisions, and action items by speaker."); }
+  setText("#modalTitle", "语音与模型设置", "Speech and model settings");
+  setText(".dialog > p", "先选择语音转文字方式，再按需连接翻译与总结模型。密钥只在当前页面使用，不会保存到网站。", "Choose speech-to-text first, then optionally connect a translation and summary model. Keys are used only on this page and are not saved.");
+  const sectionTitles = document.querySelectorAll(".settings-section-title");
+  if (sectionTitles[0]) sectionTitles[0].textContent = t("语音转文字", "Speech to text");
+  if (sectionTitles[1]) sectionTitles[1].textContent = t("翻译与会后总结", "Translation and summary");
+  const speechLabels = document.querySelectorAll(".speech-grid label");
+  const labelPairs = [["识别方式", "Recognition mode"], ["云端服务", "Cloud service"], ["语音模型", "Speech model"], ["语音 API Key", "Speech API key"]];
+  speechLabels.forEach((label, index) => { if (labelPairs[index]) label.textContent = t(...labelPairs[index]); });
+  $("#speechMode").options[0].text = t("自动选择", "Auto");
+  $("#speechMode").options[1].text = t("浏览器实时识别", "Browser live recognition");
+  $("#speechMode").options[2].text = t("云端精准识别", "Cloud transcription");
+  const notes = document.querySelectorAll(".provider-note");
+  if (notes[0]) notes[0].textContent = t("ChatGPT 登录只用于账号验证，不包含 OpenAI API 额度。云端识别约每 6 秒更新一次字幕。", "ChatGPT sign-in verifies your account; it does not include OpenAI API credits. Cloud captions update about every 6 seconds.");
+  const textLabels = document.querySelectorAll(".dialog > .field label, .model-row label");
+  const textLabelPairs = [["Chat Completions 地址", "Chat Completions endpoint"], ["模型名称", "Model name"], ["API Key", "API key"]];
+  textLabels.forEach((label, index) => { if (textLabelPairs[index]) label.textContent = t(...textLabelPairs[index]); });
+  if (notes[1]) notes[1].textContent = uiLanguage === "zh" ? providers[config.provider].note : "Connect any OpenAI-compatible text model for translation and meeting summaries.";
+  $("#endpointHint").textContent = uiLanguage === "zh" ? providers[config.provider].hint : "OpenAI-compatible text model endpoint";
+  $("#speechKey").placeholder = uiLanguage === "zh" ? speechProviders[speechConfig.provider].placeholder : `Enter ${speechProviders[speechConfig.provider].name} API key`;
+  setText("#cancelBtn", "取消", "Cancel");
+  setText("#saveBtn", "保存设置", "Save settings");
+  updateSpeechSupport();
+  refreshMicrophones();
+}
+
 function toast(message) {
   const element = $("#toast");
   element.textContent = message;
   element.classList.add("show");
   window.setTimeout(() => element.classList.remove("show"), 2600);
+}
+
+function microphoneConstraints() {
+  const selected = $("#micDevice")?.value;
+  return {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    ...(selected ? { deviceId: { exact: selected } } : {}),
+  };
+}
+
+async function refreshMicrophones() {
+  if (!navigator.mediaDevices?.enumerateDevices || !$("#micDevice")) return;
+  try {
+    const previous = $("#micDevice").value;
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === "audioinput");
+    $("#micDevice").innerHTML = `<option value="">${t("系统默认麦克风", "System default microphone")}</option>` + devices.map((device, index) => `<option value="${escapeHtml(device.deviceId)}">${escapeHtml(device.label || `${t("麦克风", "Microphone")} ${index + 1}`)}</option>`).join("");
+    if (devices.some((device) => device.deviceId === previous)) $("#micDevice").value = previous;
+  } catch { /* device labels may require permission */ }
+}
+
+function startAudioMeter(stream) {
+  stopAudioMeter();
+  detectedSound = false;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  audioContext = new AudioContextClass();
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.72;
+  const source = audioContext.createMediaStreamSource(stream);
+  source.connect(analyser);
+  const samples = new Uint8Array(analyser.fftSize);
+  const bars = Array.from(document.querySelectorAll(".meter i"));
+  $(".meter")?.classList.add("mic-live");
+  const update = () => {
+    analyser.getByteTimeDomainData(samples);
+    let sum = 0;
+    for (const sample of samples) {
+      const normalized = (sample - 128) / 128;
+      sum += normalized * normalized;
+    }
+    const rms = Math.sqrt(sum / samples.length);
+    if (rms > 0.018) detectedSound = true;
+    const level = Math.min(1, rms * 9);
+    bars.forEach((bar, index) => {
+      const shape = [0.55, 0.82, 1, 0.76, 0.48][index] || 0.6;
+      bar.style.height = `${Math.max(6, Math.round(6 + level * 23 * shape))}px`;
+    });
+    meterFrame = window.requestAnimationFrame(update);
+  };
+  update();
+}
+
+function stopAudioMeter() {
+  if (meterFrame) window.cancelAnimationFrame(meterFrame);
+  meterFrame = null;
+  analyser = null;
+  if (audioContext) audioContext.close().catch(() => {});
+  audioContext = null;
+  const meter = $(".meter");
+  meter?.classList.remove("mic-live", "mic-silent");
+  document.querySelectorAll(".meter i").forEach((bar) => { bar.style.height = "8px"; });
+}
+
+function scheduleSoundCheck() {
+  window.clearTimeout(soundWatchdog);
+  window.clearTimeout(recognitionWatchdog);
+  soundWatchdog = window.setTimeout(() => {
+    if (!recording || detectedSound) return;
+    $(".meter")?.classList.add("mic-silent");
+    $("#statusSub").textContent = t("没有检测到麦克风声音，请选择其他麦克风或运行测试", "No microphone input detected. Choose another device or run the mic test.");
+  }, 3500);
+  recognitionWatchdog = window.setTimeout(() => {
+    if (!recording || recognitionMode !== "browser" || !detectedSound || lines.length) return;
+    $("#statusSub").textContent = t("已检测到声音，但浏览器没有返回文字；请切换到云端精准识别", "Audio is present, but the browser returned no text. Switch to cloud transcription.");
+  }, 9000);
+}
+
+async function testMicrophone() {
+  if (recording) return toast(t("请先结束当前录音", "Stop the current recording first"));
+  if (!navigator.mediaDevices?.getUserMedia) return toast(t("当前浏览器无法访问麦克风", "This browser cannot access the microphone"));
+  $("#testMicBtn").disabled = true;
+  $("#testMicBtn").textContent = t("测试中…", "Testing…");
+  $("#micResult").className = "mic-result";
+  $("#micResult").textContent = t("请正常说话", "Speak normally");
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+    await refreshMicrophones();
+    startAudioMeter(stream);
+    const chunks = [];
+    const mimeType = preferredAudioType();
+    const recorder = window.MediaRecorder ? new MediaRecorder(stream, mimeType ? { mimeType } : undefined) : null;
+    if (recorder) {
+      recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+      recorder.start();
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 3000));
+    if (recorder?.state === "recording") {
+      await new Promise((resolve) => { recorder.onstop = resolve; recorder.stop(); });
+    }
+    if (chunks.length) {
+      if (micTestUrl) URL.revokeObjectURL(micTestUrl);
+      micTestUrl = URL.createObjectURL(new Blob(chunks, { type: recorder?.mimeType || mimeType || "audio/webm" }));
+      $("#micPlayback").src = micTestUrl;
+      $("#micPlayback").hidden = false;
+    }
+    $("#micResult").className = `mic-result ${detectedSound ? "ok" : "warn"}`;
+    $("#micResult").textContent = detectedSound ? t("检测到声音，可点击回放", "Audio detected — play it back") : t("未检测到声音，请更换麦克风", "No audio detected — choose another microphone");
+  } catch (error) {
+    $("#micResult").className = "mic-result warn";
+    $("#micResult").textContent = error?.name === "NotAllowedError" ? t("麦克风权限被拒绝", "Microphone permission denied") : t("无法打开麦克风", "Could not open microphone");
+  } finally {
+    stream?.getTracks().forEach((track) => track.stop());
+    stopAudioMeter();
+    $("#testMicBtn").disabled = false;
+    $("#testMicBtn").textContent = t("测试 3 秒", "Test 3 sec");
+  }
 }
 
 function stamp() {
@@ -122,14 +330,14 @@ function render(interim = "") {
     <div class="line">
       <span class="stamp">${line.time}</span>
       <div>
-        <div class="utterance-head"><button class="speaker-badge s${line.speaker}" onclick="cycleSpeaker(${index})" title="点按更换说话人">说话人 ${line.speaker}</button></div>
+        <div class="utterance-head"><button class="speaker-badge s${line.speaker}" onclick="cycleSpeaker(${index})" title="${t("点按更换说话人", "Tap to change speaker")}">${t("说话人", "Speaker")} ${line.speaker}</button></div>
         <div class="words">${escapeHtml(line.text)}</div>
         ${line.translation ? `<div class="translation">${escapeHtml(line.translation)}</div>` : ""}
       </div>
     </div>`).join("") + (interim ? `
     <div class="line interim">
       <span class="stamp">${stamp()}</span>
-      <div><div class="utterance-head"><span class="speaker-badge s${activeSpeaker}">说话人 ${activeSpeaker}</span></div><div class="words">${escapeHtml(interim)}</div></div>
+      <div><div class="utterance-head"><span class="speaker-badge s${activeSpeaker}">${t("说话人", "Speaker")} ${activeSpeaker}</span></div><div class="words">${escapeHtml(interim)}</div></div>
     </div>` : "");
   box.scrollTop = box.scrollHeight;
 }
@@ -144,7 +352,7 @@ function selectSpeaker(number) {
 function cycleSpeaker(index) {
   lines[index].speaker = lines[index].speaker % speakerCount + 1;
   render();
-  toast(`已改为说话人 ${lines[index].speaker}`);
+  toast(t(`已改为说话人 ${lines[index].speaker}`, `Changed to Speaker ${lines[index].speaker}`));
 }
 
 window.cycleSpeaker = cycleSpeaker;
@@ -222,7 +430,7 @@ function setupNativeRecognition() {
   instance.onerror = (event) => {
     if (event.error === "aborted" || event.error === "no-speech") return;
     const fatal = ["not-allowed", "service-not-allowed", "network"].includes(event.error);
-    toast(event.error === "not-allowed" ? "麦克风权限被拒绝，请在浏览器设置中允许" : "浏览器语音识别不可用，可切换到云端识别");
+    toast(event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许", "Microphone permission denied. Allow it in browser settings.") : t("浏览器语音识别不可用，可切换到云端识别", "Browser speech recognition is unavailable. Switch to cloud transcription."));
     if (fatal && recording) stopRecording();
   };
   instance.onend = () => {
@@ -315,42 +523,50 @@ async function toggleRecord() {
     return;
   }
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-    toast("当前页面无法使用麦克风，请使用 HTTPS 并允许麦克风权限");
+    toast(t("当前页面无法使用麦克风，请使用 HTTPS 并允许麦克风权限", "Microphone access is unavailable. Use HTTPS and allow microphone permission."));
     return;
   }
 
   speechConfig.mode = $("#speechMode").value;
   const useNative = speechConfig.mode === "browser" || (speechConfig.mode === "auto" && supportsNativeRecognition());
   if (speechConfig.mode === "browser" && !supportsNativeRecognition()) {
-    showSpeechSetup("此浏览器不支持浏览器实时识别，请选择云端精准识别");
+    showSpeechSetup(t("此浏览器不支持浏览器实时识别，请选择云端精准识别", "This browser does not support live recognition. Choose cloud transcription."));
     return;
   }
   if (!useNative && (!supportsCloudRecording() || !speechConfig.key)) {
-    showSpeechSetup(!supportsCloudRecording() ? "当前浏览器无法录音，请改用最新版 Chrome、Edge 或 Safari" : "当前浏览器需要云端识别，请填写 OpenAI 或 Groq API Key");
+    showSpeechSetup(!supportsCloudRecording() ? t("当前浏览器无法录音，请改用最新版 Chrome、Edge 或 Safari", "This browser cannot record audio. Use the latest Chrome, Edge, or Safari.") : t("当前浏览器需要云端识别，请填写 OpenAI 或 Groq API Key", "Cloud transcription is required here. Enter an OpenAI or Groq API key."));
     return;
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+    mediaStream = stream;
+    await refreshMicrophones();
+    startAudioMeter(stream);
     if (useNative) {
-      stream.getTracks().forEach((track) => track.stop());
       recognition = setupNativeRecognition();
       if (!recognition) {
-        showSpeechSetup("浏览器实时识别不可用，请切换到云端精准识别");
+        stream.getTracks().forEach((track) => track.stop());
+        stopAudioMeter();
+        mediaStream = null;
+        showSpeechSetup(t("浏览器实时识别不可用，请切换到云端精准识别", "Browser recognition is unavailable. Switch to cloud transcription."));
         return;
       }
       recognitionMode = "browser";
-      startSession("浏览器实时识别中");
+      startSession(t("浏览器实时识别中", "Browser live recognition"));
       recognition.start();
     } else {
-      mediaStream = stream;
       speechConfig.failed = false;
       recognitionMode = "cloud";
-      startSession(`${speechProviders[speechConfig.provider].name} 识别中，约每 6 秒更新`);
+      startSession(`${speechProviders[speechConfig.provider].name} ${t("识别中，约每 6 秒更新", "transcribing, updates about every 6 seconds")}`);
       startCloudSegment();
     }
+    scheduleSoundCheck();
   } catch (error) {
-    toast(error?.name === "NotAllowedError" ? "请在浏览器设置中允许麦克风权限" : "无法打开麦克风，请检查系统权限");
+    stopAudioMeter();
+    mediaStream?.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+    toast(error?.name === "NotAllowedError" ? t("请在浏览器设置中允许麦克风权限", "Allow microphone access in browser settings") : t("无法打开麦克风，请检查系统权限", "Could not open the microphone. Check system permission."));
   }
 }
 
@@ -359,9 +575,9 @@ function startSession(statusDetail) {
   startTime = Date.now();
   $("#timer").textContent = "00:00";
   $("#recorder").classList.add("recording");
-  $("#statusText").textContent = "正在聆听";
+  $("#statusText").textContent = t("正在聆听", "Listening");
   $("#statusSub").textContent = statusDetail;
-  $("#recordLabel").textContent = "结束录音";
+  $("#recordLabel").textContent = t("结束录音", "Stop recording");
   tick = window.setInterval(() => { $("#timer").textContent = stamp(); }, 500);
 }
 
@@ -371,6 +587,8 @@ async function stopRecording() {
   window.clearInterval(tick);
   window.clearInterval(demoTimer);
   window.clearTimeout(segmentTimer);
+  window.clearTimeout(soundWatchdog);
+  window.clearTimeout(recognitionWatchdog);
   try { recognition?.stop(); } catch { /* already stopped */ }
 
   if (recognitionMode === "cloud" && mediaRecorder?.state === "recording") {
@@ -382,14 +600,15 @@ async function stopRecording() {
     await transcriptionQueue;
   }
   mediaStream?.getTracks().forEach((track) => track.stop());
+  stopAudioMeter();
   mediaStream = null;
   mediaRecorder = null;
   recognitionMode = "";
 
   $("#recorder").classList.remove("recording", "transcribing");
-  $("#statusText").textContent = lines.length ? "转写已完成" : "没有识别到语音";
-  $("#statusSub").textContent = lines.length ? `共记录 ${lines.length} 段内容` : "请靠近麦克风后重试，或检查语音 API 设置";
-  $("#recordLabel").textContent = "继续录音";
+  $("#statusText").textContent = lines.length ? t("转写已完成", "Transcription complete") : t("没有识别到语音", "No speech recognized");
+  $("#statusSub").textContent = lines.length ? t(`共记录 ${lines.length} 段内容`, `${lines.length} segments captured`) : t("请运行麦克风测试，或检查云端语音 API 设置", "Run the microphone test or check the cloud speech API settings");
+  $("#recordLabel").textContent = t("继续录音", "Record again");
   if (lines.length) await summarize();
 }
 
@@ -446,9 +665,9 @@ function chooseProvider(id) {
   document.querySelectorAll(".provider-card").forEach((button) => button.classList.toggle("active", button.dataset.provider === id));
   $("#endpoint").value = provider.endpoint;
   $("#model").value = provider.model;
-  $("#endpointHint").textContent = provider.hint;
-  $("#providerNote").textContent = provider.note;
-  $("#apiKey").placeholder = id === "ollama" ? "本地模型无需填写" : "可稍后填写";
+  $("#endpointHint").textContent = uiLanguage === "zh" ? provider.hint : "OpenAI-compatible text model endpoint";
+  $("#providerNote").textContent = uiLanguage === "zh" ? provider.note : "Use this model for translation, cleanup, and post-meeting summaries.";
+  $("#apiKey").placeholder = id === "ollama" ? t("本地模型无需填写", "No key needed for local model") : t("可稍后填写", "Optional for now");
   $("#modelSuggestions").innerHTML = provider.models.map((model) => `<option value="${model}">`).join("");
 }
 
@@ -456,7 +675,7 @@ function chooseSpeechProvider(id) {
   speechConfig.provider = id;
   const provider = speechProviders[id];
   $("#speechModel").value = provider.model;
-  $("#speechKey").placeholder = provider.placeholder;
+  $("#speechKey").placeholder = uiLanguage === "zh" ? provider.placeholder : `Enter ${provider.name} API key`;
   updateSpeechSupport();
 }
 
@@ -474,9 +693,9 @@ function updateSpeechSupport(message = "") {
     support.textContent = message;
     support.classList.add("warn");
   } else if (nativeSupported) {
-    support.textContent = selectedMode === "cloud" ? "将使用云端语音识别，字幕约每 6 秒更新。" : "当前浏览器支持实时识别；自动模式会优先使用浏览器能力。";
+    support.textContent = selectedMode === "cloud" ? t("将使用云端语音识别，字幕约每 6 秒更新。", "Cloud transcription will update captions about every 6 seconds.") : t("当前浏览器支持实时识别；自动模式会优先使用浏览器能力。", "This browser supports live recognition; Auto will prefer it.");
   } else {
-    support.textContent = "当前浏览器不支持内置实时识别。请选择云端精准识别并填写 API Key。";
+    support.textContent = t("当前浏览器不支持内置实时识别。请选择云端精准识别并填写 API Key。", "Built-in live recognition is unavailable. Choose cloud transcription and enter an API key.");
     support.classList.add("warn");
   }
 }
@@ -498,28 +717,30 @@ function saveSettings() {
   config.endpoint = $("#endpoint").value.trim();
   config.model = $("#model").value.trim();
 
-  if (!speechConfig.model) return toast("请填写语音模型名称");
+  if (!speechConfig.model) return toast(t("请填写语音模型名称", "Enter a speech model name"));
   const needsCloud = speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
-  if (needsCloud && !speechConfig.key) return toast("当前识别方式需要语音 API Key");
-  if (!config.endpoint || !config.model) return toast("请填写文本模型接口和名称");
+  if (needsCloud && !speechConfig.key) return toast(t("当前识别方式需要语音 API Key", "This recognition mode requires a speech API key"));
+  if (!config.endpoint || !config.model) return toast(t("请填写文本模型接口和名称", "Enter the text model endpoint and name"));
 
   speechConfig.failed = false;
-  const speechName = needsCloud ? speechProviders[speechConfig.provider].name : "浏览器语音";
+  const speechName = needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
   $("#providerBadge").textContent = config.key ? `${speechName} · ${providers[config.provider].name}` : speechName;
   $("#modal").classList.remove("open");
-  $("#statusSub").textContent = needsCloud ? `${speechName} 已就绪，点击开始录音` : "浏览器实时识别已就绪";
-  toast("设置已保存，可以开始录音");
+  $("#statusSub").textContent = needsCloud ? t(`${speechName} 已就绪，点击开始录音`, `${speechName} is ready. Start recording.`) : t("浏览器实时识别已就绪", "Browser live recognition is ready");
+  toast(t("设置已保存，可以开始录音", "Settings saved. You can start recording."));
 }
 
 $("#recordBtn").onclick = toggleRecord;
 $("#demoBtn").onclick = runDemo;
+$("#testMicBtn").onclick = testMicrophone;
+$("#uiLangBtn").onclick = () => { uiLanguage = uiLanguage === "zh" ? "en" : "zh"; applyUiLanguage(); render(); };
 document.querySelectorAll("[data-speaker]").forEach((button) => { button.onclick = () => selectSpeaker(Number(button.dataset.speaker)); });
 $("#addSpeaker").onclick = () => {
   speakerCount += 1;
   const button = document.createElement("button");
   button.className = "speakerbtn";
   button.dataset.speaker = speakerCount;
-  button.textContent = `说话人 ${speakerCount}`;
+  button.textContent = `${t("说话人", "Speaker")} ${speakerCount}`;
   button.onclick = () => selectSpeaker(speakerCount);
   $("#addSpeaker").before(button);
   selectSpeaker(speakerCount);
@@ -530,6 +751,9 @@ $("#speechMode").onchange = () => updateSpeechSupport();
 chooseProvider("deepseek");
 chooseSpeechProvider("openai");
 updateSpeechSupport();
+applyUiLanguage();
+refreshMicrophones();
+if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = refreshMicrophones;
 $("#settingsBtn").onclick = () => { updateSpeechSupport(); $("#modal").classList.add("open"); };
 $("#cancelBtn").onclick = () => $("#modal").classList.remove("open");
 $("#modal").onclick = (event) => { if (event.target.id === "modal") event.currentTarget.classList.remove("open"); };
@@ -542,7 +766,7 @@ $("#copyBtn").onclick = async () => {
 $("#historyBtn").onclick = () => toast("第一版暂不保存历史记录，保护本地隐私");
 
 if (!supportsNativeRecognition()) {
-  $("#statusSub").textContent = "当前浏览器需在模型设置中配置云端语音识别";
+  $("#statusSub").textContent = t("当前浏览器需在模型设置中配置云端语音识别", "Configure cloud speech recognition in Model settings");
 }
 
 if (document.modelContext?.registerTool) {
