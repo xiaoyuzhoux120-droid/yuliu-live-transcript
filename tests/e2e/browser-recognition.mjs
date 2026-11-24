@@ -47,11 +47,15 @@ await page.addInitScript(() => {
 const chatCalls = [];
 await page.route("https://mock-llm.test/**", async (route) => {
   const payload = JSON.parse(route.request().postData());
-  const match = payload.messages[1].content.match(/<transcript>\n([\s\S]*?)\n<\/transcript>/);
-  if (!match) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ choices: [{ message: { content: "摘要" } }] }) });
-  chatCalls.push(payload);
-  const source = match[1];
-  const content = JSON.stringify({ text: source.replace("cooper netes", "Kubernetes"), translation: `[EN] ${source}` });
+  // 翻译请求来自 ai-engine.js：system 提示为“同声传译”；批量时 user 为 {context, items} JSON，逐句时为“原文：…”
+  const isTranslation = /同声传译/.test(payload.messages[0].content);
+  let content = "摘要";
+  if (isTranslation) {
+    chatCalls.push(payload);
+    const user = payload.messages[1].content;
+    if (user.trim().startsWith("{")) content = JSON.stringify({ t: JSON.parse(user).items.map((item) => `[EN] ${item}`) });
+    else content = `[EN] ${user.split("原文：").pop()}`;
+  }
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ choices: [{ message: { content } }] }) });
 });
 
@@ -63,29 +67,30 @@ await page.click('.provider-card[data-provider="custom"]');
 await page.fill("#endpoint", "https://mock-llm.test/v1/chat/completions");
 await page.fill("#model", "mock-model");
 await page.fill("#apiKey", "test-not-a-real-key");
+await page.selectOption("#aiMode", "quality"); // 高质量模式逐句立即翻译（省钱模式会合并 6 秒内的句子）
 await page.click("#saveBtn");
 await page.click("#recordBtn");
 await page.waitForFunction(() => window.__recognition);
 
-// 中间结果：只更新 #interimLine，不重建已确认段落
+// 中间结果：只更新中间结果行，不重建已确认段落
 await page.evaluate(() => window.__emit([["我们今天", false]]));
 await page.evaluate(() => window.__emit([["我们今天确认发布", false]]));
-assert.equal(await page.textContent("#interimLine .words"), "我们今天确认发布");
+assert.equal(await page.textContent("#transcript .line.interim .words"), "我们今天确认发布");
 await page.evaluate(() => window.__emit([["我们今天确认 cooper netes 发布计划", true]]));
 await page.evaluate(() => window.__emit([["Let's ship it on Friday", true]]));
 await page.waitForTimeout(600);
-assert.equal(await page.isHidden("#interimLine"), true, "最终结果后中间行应隐藏");
+assert.equal(await page.locator("#transcript .line.interim").count(), 0, "最终结果后中间行应移除");
 
 const lines = await page.$$eval("#transcript .line:not(.interim)", (nodes) => nodes.map((node) => ({
   words: node.querySelector(".words")?.textContent,
   translation: node.querySelector(".translation")?.textContent || "",
 })));
 console.table(lines);
-assert.equal(lines[0].words, "我们今天确认 Kubernetes 发布计划。", "应补全标点并按术语表修正识别错字");
+assert.equal(lines[0].words, "我们今天确认 cooper netes 发布计划。", "浏览器识别结果应在本地补全句末标点");
 assert.equal(lines[0].translation, "[EN] 我们今天确认 cooper netes 发布计划。");
 assert.equal(lines[1].words, "Let's ship it on Friday.");
 assert.equal(lines[1].translation, "", "已经是英文的句子不应再翻译成英文");
-assert.match(chatCalls[0].messages[1].content, /JSON/);
+assert.match(chatCalls[0].messages[0].content, /术语表[\s\S]*Kubernetes/, "翻译应带术语表");
 
 await page.click("#recordBtn");
 await page.waitForTimeout(300);

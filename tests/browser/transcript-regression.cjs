@@ -52,11 +52,15 @@ async function setup(browser, opts = {}) {
   await page.addInitScript(() => { const md = navigator.mediaDevices; const orig = md.getUserMedia.bind(md); md.getUserMedia = async (c) => { const s = await orig(c); window.__lastStream = s; return s; }; });
   if (opts.native !== false) await page.addInitScript(fakeSR);
   else await page.addInitScript(() => { delete window.SpeechRecognition; delete window.webkitSpeechRecognition; });
-  if (FAST) await page.addInitScript(() => { window.__YULIU_TUNING__ = { segmentMs: 2500, translateTimeoutMs: 2000, summaryTimeoutMs: 3000, transcribeTimeoutMs: 3000, retryDelayMs: 200 }; });
+  if (FAST) await page.addInitScript(() => { window.__YULIU_TUNING__ = { segmentMs: 2500, translateTimeoutMs: 2000, summaryTimeoutMs: 3000, transcribeTimeoutMs: 3000, retryDelayMs: 200, vad: { maxSegmentMs: 2500, softMaxMs: 2000 } }; });
   await page.route(`${ORIGIN}/**`, async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/app") return route.fulfill({ contentType: "text/html", body: html });
     if (url.pathname === "/transcript.js") return route.fulfill({ contentType: "text/javascript", body: js });
+    // Helper modules that transcript.js depends on (speech-core.js, ai-engine.js).
+    if (/^\/[\w-]+\.js$/.test(url.pathname) && fs.existsSync(path.join(root, "public", url.pathname))) {
+      return route.fulfill({ contentType: "text/javascript", body: fs.readFileSync(path.join(root, "public", url.pathname), "utf8") });
+    }
     if (url.pathname === "/api/transcribe") {
       state.transcribeCalls += 1;
       const n = state.transcribeCalls;
@@ -67,7 +71,7 @@ async function setup(browser, opts = {}) {
     if (url.pathname === "/llm") {
       const body = JSON.parse(route.request().postData() || "{}");
       state.llmCalls.push(body);
-      const r = state.llmResponder ? await state.llmResponder(body, route) : { content: body.messages[1].content.includes("总结") ? "摘要OK" : "TR:" + body.messages[1].content.split("\n\n").pop() };
+      const r = state.llmResponder ? await state.llmResponder(body, route) : { content: isSummaryRequest(body) ? "摘要OK" : "TR:" + body.messages[1].content.split("\n\n").pop() };
       if (r === "hang") return;
       return route.fulfill({ status: r.status || 200, contentType: "application/json", body: JSON.stringify({ choices: [{ message: { content: r.content } }] }) });
     }
@@ -87,6 +91,8 @@ async function configure(page, { mode = "auto", speechKey = "", llmKey = "", pro
   await page.click("#saveBtn");
 }
 
+// Summary requests come from ai-engine.js: its system prompt is the meeting-minutes one.
+const isSummaryRequest = (body) => body.messages.some((m) => m.role === "system" && /会议纪要|总结/.test(m.content));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const lineTexts = (page) => page.$$eval("#transcript .line:not(.interim) .words", (els) => els.map((e) => e.textContent));
 const stamps = (page) => page.$$eval("#transcript .line:not(.interim) .stamp", (els) => els.map((e) => e.textContent));
@@ -156,7 +162,7 @@ const tests = {
     await page.click("#recordBtn"); // stop; FakeSR delivers final 300ms later
     await page.waitForFunction(() => document.querySelector("#summaryTitle").textContent !== "正在整理…" && document.querySelector("#summaryTitle").textContent !== "录音结束后生成", null, { timeout: 10000 });
     await wait(800);
-    const summaryReq = state.llmCalls.find((c) => c.messages[1].content.includes("总结"));
+    const summaryReq = state.llmCalls.find((c) => isSummaryRequest(c));
     const included = summaryReq?.messages[1].content.includes("最后一句话");
     if (!included) throw new Error("summary request missed final result delivered after stop()");
     return "summary request includes the last sentence";
@@ -234,7 +240,7 @@ const tests = {
   },
 
   async cloud_queue_not_blocked_by_translation({ page, state }) {
-    state.llmResponder = async (body) => { if (body.messages[1].content.includes("总结")) return { content: "摘要" }; await wait(FAST ? 6000 : 14000); return { content: "TR" }; };
+    state.llmResponder = async (body) => { if (isSummaryRequest(body)) return { content: "摘要" }; await wait(FAST ? 6000 : 14000); return { content: "TR" }; };
     await configure(page, { mode: "cloud", speechKey: "sk-test", llmKey: "k" });
     await page.click("#recordBtn");
     const seg = FAST ? 2500 : 6000;
@@ -247,7 +253,7 @@ const tests = {
 
   async hung_summary_times_out({ page, state }) {
     if (!FAST) return "skipped (needs tuning hook)";
-    state.llmResponder = (body) => (body.messages[1].content.includes("总结") ? "hang" : { content: "TR" });
+    state.llmResponder = (body) => (isSummaryRequest(body) ? "hang" : { content: "TR" });
     await configure(page, { llmKey: "k" });
     await page.click("#recordBtn");
     await wait(200);

@@ -1,6 +1,6 @@
 // 端到端测试：真实 Chromium + 合成麦克风音频 + 模拟语音/翻译接口（不调用任何付费服务）
 // 验证：按停顿断句、长静音不上传、识别 prompt 带术语表与上下文、临时错误自动重试、
-//       静音幻觉被过滤、翻译请求带术语表且结果显示在字幕中。
+//       静音幻觉被过滤、翻译请求（ai-engine.js）带术语表与上文且结果显示在字幕中。
 // 运行：node tests/e2e/cloud-transcription.mjs   （需要 playwright 与 Chromium）
 import { createServer } from "node:http";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
@@ -92,9 +92,15 @@ await page.route("**/api/transcribe", async (route) => {
 const chatCalls = [];
 await page.route("https://mock-llm.test/**", async (route) => {
   const payload = JSON.parse(route.request().postData());
-  const match = payload.messages[1].content.match(/<transcript>\n([\s\S]*?)\n<\/transcript>/);
-  if (match) chatCalls.push(payload);
-  const content = match ? `[EN] ${match[1]}` : "会后摘要（模拟）";
+  // 翻译请求来自 ai-engine.js：system 提示为“同声传译”；批量时 user 为 {context, items} JSON，逐句时为“原文：…”
+  const isTranslation = /同声传译/.test(payload.messages[0].content);
+  let content = "摘要";
+  if (isTranslation) {
+    chatCalls.push(payload);
+    const user = payload.messages[1].content;
+    if (user.trim().startsWith("{")) content = JSON.stringify({ t: JSON.parse(user).items.map((item) => `[EN] ${item}`) });
+    else content = `[EN] ${user.split("原文：").pop()}`;
+  }
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ choices: [{ message: { content } }] }) });
 });
 
@@ -140,6 +146,6 @@ assert.equal(lines.length, 2, "“谢谢观看”幻觉应被过滤");
 assert.deepEqual(lines.map((line) => line.words), ["我们今天确认 Kubernetes 的发布计划", "下一步由产品团队整理反馈"]);
 assert.ok(lines.every((line) => line.translation.startsWith("[EN] ")), "每行都应显示译文");
 assert.ok(chatCalls.length >= 2);
-assert.match(chatCalls[0].messages[0].content, /Kubernetes（保持原样）/, "翻译应带术语表");
-assert.match(chatCalls.at(-1).messages[1].content, /此前的对话/, "翻译应带上下文");
+assert.match(chatCalls[0].messages[0].content, /术语表[\s\S]*Kubernetes/, "翻译应带术语表");
+assert.match(chatCalls.at(-1).messages[1].content, /"context":\["我们今天确认|context：我们今天确认/, "翻译应带上文");
 console.log("\n✅ 端到端测试通过");

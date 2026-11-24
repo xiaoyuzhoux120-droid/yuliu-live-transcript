@@ -14,6 +14,7 @@ const html = await readFile(new URL("app/app/transcript.html", root), "utf8");
 const scripts = {
   "/transcript.js": await readFile(new URL("public/transcript.js", root), "utf8"),
   "/ai-engine.js": await readFile(new URL("public/ai-engine.js", root), "utf8"),
+  "/speech-core.js": await readFile(new URL("public/speech-core.js", root), "utf8"),
 };
 
 const requests = [];

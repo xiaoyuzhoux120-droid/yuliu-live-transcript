@@ -43,12 +43,14 @@ const TUNING = Object.assign({
   retryDelayMs: 1500,
   transcribeRetries: 2,
   recognitionEndGraceMs: 1500,
+  vad: {}, // overrides for Speech.VAD_DEFAULTS (pause-based segmentation)
 }, window.__YULIU_TUNING__ || {});
 let meterSamples = null;
 let vadSegmenter = null;
 let vadTimer = null;
 let glossary = [];
-const MAX_SEGMENT_MS = Speech.VAD_DEFAULTS.maxSegmentMs;
+const VAD_OPTIONS = { ...Speech.VAD_DEFAULTS, ...TUNING.vad };
+const MAX_SEGMENT_MS = VAD_OPTIONS.maxSegmentMs;
 let lastSummary = null;
 
 const config = {
@@ -242,9 +244,9 @@ function applyUiLanguage() {
   $("#speechMode").options[2].text = t("云端精准识别", "Cloud transcription");
   const notes = document.querySelectorAll(".provider-note");
   if (notes[0]) notes[0].textContent = t("ChatGPT 登录只用于账号验证，不包含 OpenAI API 额度。云端识别会在说话停顿处自动断句后更新字幕。", "ChatGPT sign-in verifies your account; it does not include OpenAI API credits. Cloud captions update at natural pauses.");
-  const textLabels = document.querySelectorAll(".dialog > .field label, .model-row label");
-  const textLabelPairs = [["Chat Completions 地址", "Chat Completions endpoint"], ["模型名称", "Model name"], ["API Key", "API key"], ["运行模式", "Run mode"], ["总结模型（可选）", "Summary model (optional)"], ["术语表（可选）", "Glossary (optional)"]];
-  textLabels.forEach((label, index) => { if (textLabelPairs[index]) label.textContent = t(...textLabelPairs[index]); });
+  // Label by the input they belong to: index-based lookup broke whenever a field was added above.
+  const textLabelPairs = { endpoint: ["Chat Completions 地址", "Chat Completions endpoint"], model: ["模型名称", "Model name"], apiKey: ["API Key", "API key"], aiMode: ["运行模式", "Run mode"], summaryModel: ["总结模型（可选）", "Summary model (optional)"] };
+  Object.entries(textLabelPairs).forEach(([id, pair]) => setText(`label[for=${id}]`, ...pair));
   if ($("#aiMode")) {
     $("#aiMode").options[0].text = t("省钱模式：合并翻译请求、关闭思考", "Economy: batched translation, no reasoning");
     $("#aiMode").options[1].text = t("高质量模式：逐句带上文翻译、强模型总结", "Quality: per-line contextual translation, stronger summary model");
@@ -707,7 +709,7 @@ function failCloudTranscription(message) {
 // 停顿断句：按音量判断说话停顿，在自然停顿处切片，而不是固定每 6 秒硬切
 function startVad() {
   stopVad();
-  vadSegmenter = Speech.createVadSegmenter();
+  vadSegmenter = Speech.createVadSegmenter(VAD_OPTIONS);
   // 用定时器而不是 requestAnimationFrame：页面切到后台时 rAF 会暂停
   vadTimer = window.setInterval(() => {
     const recorder = mediaRecorder;
@@ -760,7 +762,7 @@ function startCloudSegment() {
     const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
     chunks.length = 0;
     // 没有 VAD（AudioContext 不可用）时视为有语音，保持旧行为
-    const hasSpeech = recorder.segmentHasSpeech ?? (vadSegmenter ? vadSegmenter.speechMs >= Speech.VAD_DEFAULTS.minSpeechMs : true);
+    const hasSpeech = recorder.segmentHasSpeech ?? (vadSegmenter ? vadSegmenter.speechMs >= VAD_OPTIONS.minSpeechMs : true);
     if (mediaRecorder === recorder) mediaRecorder = null;
     if (pendingSegmentStop === stopped) pendingSegmentStop = null;
     if (recording && recognitionMode === "cloud") startCloudSegment();
@@ -883,7 +885,7 @@ async function finishRecording() {
   window.clearInterval(tick);
   window.clearInterval(demoTimer);
   window.clearTimeout(segmentTimer);
-  if (mediaRecorder && vadSegmenter) mediaRecorder.segmentHasSpeech = vadSegmenter.speechMs >= Speech.VAD_DEFAULTS.minSpeechMs;
+  if (mediaRecorder && vadSegmenter) mediaRecorder.segmentHasSpeech = vadSegmenter.speechMs >= VAD_OPTIONS.minSpeechMs;
   stopVad();
   window.clearTimeout(soundWatchdog);
   window.clearTimeout(recognitionWatchdog);
