@@ -599,7 +599,7 @@ ${SUMMARY_SCHEMA}`;
         thinking: mode.summaryThinking,
         maxTokens,
         messages: [
-          { role: "system", content: summarySystemPrompt(language) },
+          { role: "system", content: summarySystemPrompt(language) + (config.summaryInstruction ? `\n补充要求（来自场景与说话人设置）：\n${String(config.summaryInstruction).slice(0, 600)}` : "") },
           { role: "user", content },
         ],
       }, { fetchImpl: this.fetchImpl, timeoutMs: this.timeoutMs, meter: this.meter, task: "summary", retries: 1 });
@@ -612,7 +612,7 @@ ${SUMMARY_SCHEMA}`;
       // 长会议：先分段提取（map），再合并（reduce），避免超出上下文或被静默截断。
       const partials = [];
       for (const [index, chunk] of chunks.entries()) {
-        const key = `${model}|${mode.id}|${hashString(chunk)}`;
+        const key = `${model}|${mode.id}|${hashString(`${config.summaryInstruction || ""}|${chunk}`)}`;
         let partial = this.cache.get(key);
         if (partial === undefined) {
           const raw = await call(`这是长会议的第 ${index + 1}/${chunks.length} 段，请只总结本段：\n${chunk}`, mode.summaryMaxTokens);
