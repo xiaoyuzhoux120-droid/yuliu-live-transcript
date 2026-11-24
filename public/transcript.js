@@ -1,6 +1,7 @@
 "use strict";
 
 const $ = (selector) => document.querySelector(selector);
+const Speech = window.YuliuSpeech;
 let recognition = null;
 let recording = false;
 let recognitionMode = "";
@@ -42,8 +43,14 @@ const TUNING = Object.assign({
   translateConcurrency: 2,
   maxCloudFailures: 3,
   retryDelayMs: 1500,
+  transcribeRetries: 2,
   recognitionEndGraceMs: 1500,
 }, window.__YULIU_TUNING__ || {});
+let meterSamples = null;
+let vadSegmenter = null;
+let vadTimer = null;
+let glossary = [];
+const MAX_SEGMENT_MS = Speech.VAD_DEFAULTS.maxSegmentMs;
 
 const config = {
   key: "",
@@ -57,6 +64,7 @@ const speechConfig = {
   provider: "openai",
   model: "gpt-transcribe",
   key: "",
+  glossary: "",
   failed: false,
 };
 
@@ -163,6 +171,8 @@ function applyUiLanguage() {
   }
   $("#sourceLang").options[0].text = t("中文", "Chinese");
   $("#sourceLang").options[1].text = "English";
+  if ($("#sourceLang").options[2]) $("#sourceLang").options[2].text = t("中英混合", "Mixed zh/en");
+  setText("label[for=glossary]", "专业术语表（可选）", "Glossary (optional)");
   $("#targetLang").options[0].text = "English";
   $("#targetLang").options[1].text = t("中文", "Chinese");
   $("#targetLang").options[2].text = t("不翻译", "Off");
@@ -199,7 +209,7 @@ function applyUiLanguage() {
   $("#speechMode").options[1].text = t("浏览器实时识别", "Browser live recognition");
   $("#speechMode").options[2].text = t("云端精准识别", "Cloud transcription");
   const notes = document.querySelectorAll(".provider-note");
-  if (notes[0]) notes[0].textContent = t("ChatGPT 登录只用于账号验证，不包含 OpenAI API 额度。云端识别约每 6 秒更新一次字幕。", "ChatGPT sign-in verifies your account; it does not include OpenAI API credits. Cloud captions update about every 6 seconds.");
+  if (notes[0]) notes[0].textContent = t("ChatGPT 登录只用于账号验证，不包含 OpenAI API 额度。云端识别会在说话停顿处自动断句后更新字幕。", "ChatGPT sign-in verifies your account; it does not include OpenAI API credits. Cloud captions update at natural pauses.");
   const textLabels = document.querySelectorAll(".dialog > .field label, .model-row label");
   const textLabelPairs = [["Chat Completions 地址", "Chat Completions endpoint"], ["模型名称", "Model name"], ["API Key", "API key"]];
   textLabels.forEach((label, index) => { if (textLabelPairs[index]) label.textContent = t(...textLabelPairs[index]); });
@@ -286,18 +296,11 @@ function startAudioMeter(stream) {
   analyser.smoothingTimeConstant = 0.72;
   const source = audioContext.createMediaStreamSource(stream);
   source.connect(analyser);
-  const samples = new Uint8Array(analyser.fftSize);
+  meterSamples = new Uint8Array(analyser.fftSize);
   const bars = Array.from(document.querySelectorAll(".meter i"));
   $(".meter")?.classList.add("mic-live");
   const update = () => {
-    analyser.getByteTimeDomainData(samples);
-    let sum = 0;
-    for (const sample of samples) {
-      const normalized = (sample - 128) / 128;
-      sum += normalized * normalized;
-    }
-    const rms = Math.sqrt(sum / samples.length);
-    if (rms > 0.018) detectedSound = true;
+    const rms = currentRms();
     const level = Math.min(1, rms * 9);
     bars.forEach((bar, index) => {
       const shape = [0.55, 0.82, 1, 0.76, 0.48][index] || 0.6;
@@ -308,10 +311,19 @@ function startAudioMeter(stream) {
   update();
 }
 
+function currentRms() {
+  if (!analyser || !meterSamples) return 0;
+  analyser.getByteTimeDomainData(meterSamples);
+  const rms = Speech.rmsFromTimeDomain(meterSamples);
+  if (rms > 0.018) detectedSound = true;
+  return rms;
+}
+
 function stopAudioMeter() {
   if (meterFrame) window.cancelAnimationFrame(meterFrame);
   meterFrame = null;
   analyser = null;
+  meterSamples = null;
   if (audioContext) audioContext.close().catch(() => {});
   audioContext = null;
   const meter = $(".meter");
@@ -536,10 +548,12 @@ async function modelTask(type, text) {
 // Adds a committed line immediately. Translation runs in the background (bounded
 // concurrency) and patches the line when it returns; the returned promise
 // resolves once that is done, but callers on hot paths should not await it.
-function addLine(text, translation = "", speaker = activeSpeaker, time = stamp()) {
-  const cleaned = String(text || "").trim();
+function addLine(text, translation = "", speaker = activeSpeaker, time = stamp(), source = "demo") {
+  let cleaned = String(text || "").trim();
   if (!cleaned) return Promise.resolve();
-  const item = { id: nextLineId++, time, text: cleaned, translation, speaker };
+  // 浏览器识别（尤其中文）没有句末标点：本地补全
+  if (source === "browser") cleaned = Speech.ensureTerminalPunctuation(cleaned);
+  const item = { id: nextLineId++, time, text: cleaned, translation, speaker, source };
   lines.push(item);
   appendLineElement(item);
   if (translation || !textModelReady() || $("#targetLang").value === "off") return Promise.resolve();
@@ -560,12 +574,13 @@ function setupNativeRecognition() {
   const instance = new SpeechRecognition();
   instance.continuous = true;
   instance.interimResults = true;
-  instance.lang = $("#sourceLang").value;
+  // Web Speech API 只能指定一种语言；“中英混合”时使用中文模型，它能识别常见英文词
+  instance.lang = $("#sourceLang").value === "auto" ? "zh-CN" : $("#sourceLang").value;
   instance.onresult = (event) => {
     let interim = "";
     for (let index = event.resultIndex; index < event.results.length; index += 1) {
       const text = event.results[index][0].transcript;
-      if (event.results[index].isFinal) addLine(text);
+      if (event.results[index].isFinal) addLine(text, "", activeSpeaker, stamp(), "browser");
       else interim += text;
     }
     // Finals can arrive after stop(); never resurrect the interim row then.
@@ -622,12 +637,23 @@ class TranscriptionError extends Error {
   }
 }
 
-async function requestTranscription(blob) {
+function cloudLanguage() {
+  const value = $("#sourceLang").value;
+  if (value === "auto") return "auto"; // 不指定语言，让模型自动处理中英混说
+  return value.startsWith("zh") ? "zh" : "en";
+}
+
+function recentTranscriptText() {
+  return lines.slice(-3).map((line) => line.text).join(" ");
+}
+
+async function requestTranscription(blob, prompt) {
   const form = new FormData();
   form.append("file", blob, audioFilename(blob.type));
   form.append("provider", speechConfig.provider);
   form.append("model", speechConfig.model);
-  form.append("language", $("#sourceLang").value.startsWith("zh") ? "zh" : "en");
+  form.append("language", cloudLanguage());
+  if (prompt) form.append("prompt", prompt);
   let response;
   try {
     response = await fetchWithTimeout("/api/transcribe", {
@@ -636,45 +662,52 @@ async function requestTranscription(blob) {
       body: form,
     }, TUNING.transcribeTimeoutMs);
   } catch (error) {
-    throw new TranscriptionError(error?.name === "AbortError" ? "语音服务响应超时" : "网络连接中断", { retriable: true });
+    throw new TranscriptionError(error?.name === "AbortError" ? t("语音服务响应超时", "Speech service timed out") : t("网络连接中断", "Network connection lost"), { retriable: true });
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    // The route marks config errors (bad key/model) with fatal:true; 400/413 for one bad segment just skip it.
     const fatal = response.status === 401 || response.status === 403 || data.fatal === true;
     const retriable = !fatal && (response.status === 429 || response.status >= 500);
-    throw new TranscriptionError(data.error || "语音服务返回错误", { fatal, retriable });
+    throw new TranscriptionError(data.error || t("语音服务返回错误", "Speech service error"), { fatal, retriable });
   }
   return typeof data.text === "string" ? data.text : "";
 }
 
-// Runs serially on transcriptionQueue. One transient failure (timeout, 429, 5xx)
-// no longer disables cloud transcription for the rest of the session: it is
-// retried once, then skipped; only auth/config errors or repeated failures stop.
-async function transcribeAudio(blob, capturedAt) {
+// Runs serially on transcriptionQueue. A transient failure (timeout, 429, 5xx)
+// is retried with backoff, then that segment is skipped and recording goes on;
+// only auth/config errors or repeated failures stop cloud transcription.
+async function transcribeAudio(blob, capturedAt, speaker = activeSpeaker) {
   if (speechConfig.failed || blob.size < 900) return;
   $("#recorder").classList.add("transcribing");
+  // 术语表 + 上一段尾部作为识别 prompt，提升专有名词与中英混说的一致性
+  const prompt = Speech.buildTranscriptionPrompt({ glossary, previousText: recentTranscriptText() });
   try {
     let text = "";
     for (let attempt = 0; ; attempt += 1) {
       try {
-        text = await requestTranscription(blob);
+        text = await requestTranscription(blob, prompt);
         break;
       } catch (error) {
-        if (error.retriable && attempt === 0 && !speechConfig.failed) {
-          await sleep(TUNING.retryDelayMs);
+        if (error.retriable && attempt < TUNING.transcribeRetries && !speechConfig.failed) {
+          $("#statusSub").textContent = t(`识别请求失败，正在重试（${attempt + 1}/${TUNING.transcribeRetries}）…`, `Request failed, retrying (${attempt + 1}/${TUNING.transcribeRetries})…`);
+          await sleep(TUNING.retryDelayMs * 2 ** attempt);
           continue;
         }
         throw error;
       }
     }
     cloudFailureStreak = 0;
-    addLine(text, "", activeSpeaker, capturedAt); // translation continues in the background
+    text = String(text || "").trim();
+    // 静音段常被 Whisper 类模型“幻听”成“谢谢观看”等套话，丢弃
+    if (text && !Speech.isLikelyHallucination(text)) addLine(text, "", speaker, capturedAt, "cloud"); // translation continues in the background
   } catch (error) {
     cloudFailureStreak += 1;
     const fatal = !(error instanceof TranscriptionError) || error.fatal || cloudFailureStreak >= TUNING.maxCloudFailures;
     if (fatal) {
       failCloudTranscription(error?.message);
     } else {
+      $("#statusSub").textContent = t(`有一段（${capturedAt}）识别失败，录音仍在继续`, `One segment (${capturedAt}) failed; recording continues`);
       toast(t("一段语音识别失败，已跳过并继续录音", "One segment failed to transcribe; recording continues."));
     }
   } finally {
@@ -694,10 +727,34 @@ function failCloudTranscription(message) {
   }, 0);
 }
 
+// 停顿断句：按音量判断说话停顿，在自然停顿处切片，而不是固定每 6 秒硬切
+function startVad() {
+  stopVad();
+  vadSegmenter = Speech.createVadSegmenter();
+  // 用定时器而不是 requestAnimationFrame：页面切到后台时 rAF 会暂停
+  vadTimer = window.setInterval(() => {
+    const recorder = mediaRecorder;
+    if (!recorder || recorder.state !== "recording") return;
+    const decision = vadSegmenter.update(currentRms(), performance.now());
+    if (decision) {
+      recorder.segmentHasSpeech = decision.hasSpeech;
+      pendingSegmentStop = recorder.__stopped;
+      recorder.stop();
+    }
+  }, 50);
+}
+
+function stopVad() {
+  window.clearInterval(vadTimer);
+  vadTimer = null;
+  vadSegmenter = null;
+}
+
 function startCloudSegment() {
   if (!recording || recognitionMode !== "cloud" || !mediaStream || speechConfig.failed) return;
   const chunks = [];
   const capturedAt = stamp();
+  const speaker = activeSpeaker;
   const mimeType = preferredAudioType();
   let recorder;
   try {
@@ -725,19 +782,23 @@ function startCloudSegment() {
     // Use this recorder's own type; the global may already point at the next segment.
     const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
     chunks.length = 0;
+    // 没有 VAD（AudioContext 不可用）时视为有语音，保持旧行为
+    const hasSpeech = recorder.segmentHasSpeech ?? (vadSegmenter ? vadSegmenter.speechMs >= Speech.VAD_DEFAULTS.minSpeechMs : true);
     if (mediaRecorder === recorder) mediaRecorder = null;
     if (pendingSegmentStop === stopped) pendingSegmentStop = null;
     if (recording && recognitionMode === "cloud") startCloudSegment();
-    transcriptionQueue = transcriptionQueue.then(() => transcribeAudio(blob, capturedAt));
+    if (hasSpeech) transcriptionQueue = transcriptionQueue.then(() => transcribeAudio(blob, capturedAt, speaker));
     resolveStopped();
   };
   recorder.start();
+  vadSegmenter?.reset(performance.now());
+  // 兜底：VAD 不可用或后台定时器被节流时，仍保证最长片段时长
   segmentTimer = window.setTimeout(() => {
     if (recorder.state === "recording") {
       pendingSegmentStop = stopped;
       recorder.stop();
     }
-  }, TUNING.segmentMs);
+  }, analyser ? MAX_SEGMENT_MS + 2000 : TUNING.segmentMs);
 }
 
 // Guards the async start/stop transitions: a second click while getUserMedia is
@@ -803,7 +864,8 @@ async function startRecording() {
     } else {
       speechConfig.failed = false;
       recognitionMode = "cloud";
-      startSession(`${speechProviders[speechConfig.provider].name} ${t("识别中，约每 6 秒更新", "transcribing, updates about every 6 seconds")}`);
+      startSession(`${speechProviders[speechConfig.provider].name} ${t("识别中，按说话停顿自动断句", "transcribing, segments at natural pauses")}`);
+      if (analyser) startVad();
       startCloudSegment();
     }
     scheduleSoundCheck();
@@ -843,10 +905,13 @@ async function finishRecording() {
   window.clearInterval(tick);
   window.clearInterval(demoTimer);
   window.clearTimeout(segmentTimer);
+  if (mediaRecorder && vadSegmenter) mediaRecorder.segmentHasSpeech = vadSegmenter.speechMs >= Speech.VAD_DEFAULTS.minSpeechMs;
+  stopVad();
   window.clearTimeout(soundWatchdog);
   window.clearTimeout(recognitionWatchdog);
   const endingRecognition = recognition;
   try { endingRecognition?.stop(); } catch { /* already stopped */ }
+  setInterim("");
 
   if (recognitionMode === "cloud") {
     // A segment may be between stop() and its onstop event; let it enqueue first.
@@ -970,7 +1035,7 @@ function updateSpeechSupport(message = "") {
     support.textContent = message;
     support.classList.add("warn");
   } else if (nativeSupported) {
-    support.textContent = selectedMode === "cloud" ? t("将使用云端语音识别，字幕约每 6 秒更新。", "Cloud transcription will update captions about every 6 seconds.") : t("当前浏览器支持实时识别；自动模式会优先使用浏览器能力。", "This browser supports live recognition; Auto will prefer it.");
+    support.textContent = selectedMode === "cloud" ? t("将使用云端语音识别，在说话停顿处断句（通常 1–3 秒出字幕），静音片段不会上传。", "Cloud transcription segments at pauses (captions usually in 1–3 s); silent audio is not uploaded.") : t("当前浏览器支持实时识别；自动模式会优先使用浏览器能力。", "This browser supports live recognition; Auto will prefer it.");
   } else {
     support.textContent = t("当前浏览器不支持内置实时识别。请选择云端精准识别并填写 API Key。", "Built-in live recognition is unavailable. Choose cloud transcription and enter an API key.");
     support.classList.add("warn");
@@ -1027,6 +1092,8 @@ function saveSettings() {
   if (endpointProblem) return toast(endpointProblem);
   Object.assign(speechConfig, nextSpeech);
   Object.assign(config, nextText);
+  speechConfig.glossary = $("#glossary")?.value || "";
+  glossary = Speech.parseGlossary(speechConfig.glossary);
 
   speechConfig.failed = false;
   const speechName = needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
