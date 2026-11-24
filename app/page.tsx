@@ -49,7 +49,8 @@ export default async function Home() {
                 <strong>欢迎回来，{user.displayName}</strong>
                 <span>{user.email}</span>
               </div>
-              <Link className="login-primary" href="/app">进入工作台 <span>→</span></Link>
+              {/* /app serves a complete protected HTML document, so this must be a top-level navigation. */}
+              <a className="login-primary" href="/app" target="_top">进入工作台</a>
             </div>
           ) : (
             <div className="login-actions">
