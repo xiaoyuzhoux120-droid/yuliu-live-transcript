@@ -14,7 +14,6 @@ let mediaStream = null;
 let mediaRecorder = null;
 let segmentTimer = null;
 let transcriptionQueue = Promise.resolve();
-let finishCloudRecording = null;
 let uiLanguage = "zh";
 let audioContext = null;
 let analyser = null;
@@ -23,6 +22,28 @@ let detectedSound = false;
 let soundWatchdog = null;
 let recognitionWatchdog = null;
 let micTestUrl = "";
+// Elapsed time from earlier recordings in this session, so "Record again" keeps timestamps monotonic.
+let elapsedOffset = 0;
+// Bumped whenever the transcript is reset or a new summary starts; late async results compare against it.
+let sessionGeneration = 0;
+let summaryGeneration = 0;
+let cloudFailureStreak = 0;
+let pendingSegmentStop = null;
+let nextLineId = 1;
+let toastTimer = null;
+let lastModelErrorToast = 0;
+
+// Timing knobs. Tests may override them before this script loads via window.__YULIU_TUNING__.
+const TUNING = Object.assign({
+  segmentMs: 6000,
+  transcribeTimeoutMs: 45000,
+  translateTimeoutMs: 20000,
+  summaryTimeoutMs: 90000,
+  translateConcurrency: 2,
+  maxCloudFailures: 3,
+  retryDelayMs: 1500,
+  recognitionEndGraceMs: 1500,
+}, window.__YULIU_TUNING__ || {});
 
 const config = {
   key: "",
@@ -195,8 +216,44 @@ function toast(message) {
   const element = $("#toast");
   element.textContent = message;
   element.classList.add("show");
-  window.setTimeout(() => element.classList.remove("show"), 2600);
+  // Reset the timer so an earlier toast's timeout cannot hide a newer message early.
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => element.classList.remove("show"), 2600);
 }
+
+function textModelReady() {
+  return Boolean(config.key) || config.provider === "ollama";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+// fetch() with a hard timeout so a stalled provider cannot freeze the queue or the summary forever.
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+// Small promise pool: caps how many translation requests run at once during fast speech.
+function createLimiter(limit) {
+  let active = 0;
+  const waiting = [];
+  const next = () => {
+    if (active >= limit || !waiting.length) return;
+    active += 1;
+    const { task, resolve, reject } = waiting.shift();
+    Promise.resolve().then(task).then(resolve, reject).finally(() => { active -= 1; next(); });
+  };
+  return (task) => new Promise((resolve, reject) => { waiting.push({ task, resolve, reject }); next(); });
+}
+
+const translationLimiter = createLimiter(TUNING.translateConcurrency);
 
 function microphoneConstraints() {
   const selected = $("#micDevice")?.value;
@@ -318,27 +375,96 @@ async function testMicrophone() {
   }
 }
 
-function stamp() {
-  const seconds = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+function elapsedMs() {
+  return elapsedOffset + (recording ? Math.max(0, Date.now() - startTime) : 0);
 }
 
+function stamp() {
+  const total = Math.floor(elapsedMs() / 1000);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return hours ? `${hours}:${mmss}` : mmss;
+}
+
+// --- Transcript rendering -------------------------------------------------
+// Committed lines are rendered once and patched in place; only the interim row
+// changes on every recognition event. Rebuilding the whole list on each interim
+// result was O(n) per event and made hour-long sessions janky.
+
+function lineMarkup(line, index) {
+  return `<span class="stamp">${escapeHtml(line.time)}</span>
+      <div>
+        <div class="utterance-head"><button type="button" class="speaker-badge s${line.speaker}" data-line-index="${index}" title="${t("点按更换说话人", "Tap to change speaker")}">${t("说话人", "Speaker")} ${line.speaker}</button></div>
+        <div class="words">${escapeHtml(line.text)}</div>
+        ${line.translation ? `<div class="translation">${escapeHtml(line.translation)}</div>` : ""}
+      </div>`;
+}
+
+function createLineElement(line, index) {
+  const element = document.createElement("div");
+  element.className = "line";
+  element.dataset.lineId = String(line.id);
+  element.innerHTML = lineMarkup(line, index);
+  return element;
+}
+
+function isNearBottom(box) {
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+}
+
+// Follow new content only if the reader is already at the bottom.
+function withAutoScroll(mutate) {
+  const box = $("#transcript");
+  const follow = isNearBottom(box);
+  mutate(box);
+  if (follow) box.scrollTop = box.scrollHeight;
+}
+
+function setInterim(text = "") {
+  withAutoScroll((box) => {
+    let row = box.querySelector(".line.interim");
+    if (!text) { row?.remove(); return; }
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "line interim";
+      row.innerHTML = `<span class="stamp"></span><div><div class="utterance-head"><span class="speaker-badge"></span></div><div class="words"></div></div>`;
+    }
+    row.querySelector(".stamp").textContent = stamp();
+    const badge = row.querySelector(".speaker-badge");
+    badge.className = `speaker-badge s${activeSpeaker}`;
+    badge.textContent = `${t("说话人", "Speaker")} ${activeSpeaker}`;
+    row.querySelector(".words").textContent = text;
+    box.appendChild(row); // keep interim last
+  });
+}
+
+function appendLineElement(line) {
+  $("#empty")?.remove();
+  withAutoScroll((box) => {
+    const element = createLineElement(line, lines.indexOf(line));
+    const interimRow = box.querySelector(".line.interim");
+    box.insertBefore(element, interimRow);
+  });
+}
+
+function updateLineElement(line) {
+  const index = lines.indexOf(line);
+  if (index === -1) return; // transcript was reset while a request was in flight
+  const element = $("#transcript").querySelector(`[data-line-id="${line.id}"]`);
+  if (!element) return;
+  withAutoScroll(() => { element.innerHTML = lineMarkup(line, index); });
+}
+
+// Full rebuild: used after a reset or a UI language switch.
 function render(interim = "") {
   const box = $("#transcript");
   $("#empty")?.remove();
-  box.innerHTML = lines.map((line, index) => `
-    <div class="line">
-      <span class="stamp">${line.time}</span>
-      <div>
-        <div class="utterance-head"><button type="button" class="speaker-badge s${line.speaker}" data-cycle-speaker="${index}" title="${t("点按更换说话人", "Tap to change speaker")}">${t("说话人", "Speaker")} ${line.speaker}</button></div>
-        <div class="words">${escapeHtml(line.text)}</div>
-        ${line.translation ? `<div class="translation">${escapeHtml(line.translation)}</div>` : ""}
-      </div>
-    </div>`).join("") + (interim ? `
-    <div class="line interim">
-      <span class="stamp">${stamp()}</span>
-      <div><div class="utterance-head"><span class="speaker-badge s${activeSpeaker}">${t("说话人", "Speaker")} ${activeSpeaker}</span></div><div class="words">${escapeHtml(interim)}</div></div>
-    </div>` : "");
+  const fragment = document.createDocumentFragment();
+  lines.forEach((line, index) => fragment.appendChild(createLineElement(line, index)));
+  box.replaceChildren(fragment);
+  setInterim(interim);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -350,16 +476,16 @@ function selectSpeaker(number) {
 }
 
 function cycleSpeaker(index) {
-  lines[index].speaker = lines[index].speaker % speakerCount + 1;
-  render();
-  toast(t(`已改为说话人 ${lines[index].speaker}`, `Changed to Speaker ${lines[index].speaker}`));
+  const line = lines[index];
+  if (!line) return;
+  line.speaker = line.speaker % speakerCount + 1;
+  updateLineElement(line);
+  toast(t(`已改为说话人 ${line.speaker}`, `Changed to Speaker ${line.speaker}`));
 }
 
 $("#transcript").addEventListener("click", (event) => {
-  const badge = event.target.closest?.("[data-cycle-speaker]");
-  if (!badge) return;
-  const index = Number(badge.dataset.cycleSpeaker);
-  if (Number.isInteger(index) && lines[index]) cycleSpeaker(index);
+  const badge = event.target.closest?.("button.speaker-badge[data-line-index]");
+  if (badge) cycleSpeaker(Number(badge.dataset.lineIndex));
 });
 
 function escapeHtml(value) {
@@ -373,7 +499,7 @@ function escapeHtml(value) {
 }
 
 async function modelTask(type, text) {
-  if (!config.key && config.provider !== "ollama") return "";
+  if (!textModelReady()) return "";
   const target = $("#targetLang").value === "zh" ? "中文" : "English";
   const prompts = {
     translate: `将以下内容自然地翻译成${target}，只输出译文：`,
@@ -382,7 +508,7 @@ async function modelTask(type, text) {
   try {
     const headers = { "Content-Type": "application/json" };
     if (config.key) headers.Authorization = `Bearer ${config.key}`;
-    const response = await fetch(config.endpoint, {
+    const response = await fetchWithTimeout(config.endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -393,27 +519,39 @@ async function modelTask(type, text) {
         ],
         temperature: 0.2,
       }),
-    });
+    }, type === "summary" ? TUNING.summaryTimeoutMs : TUNING.translateTimeoutMs);
     if (!response.ok) throw new Error();
     const data = await response.json();
     return data.choices?.[0]?.message?.content?.trim() || "";
   } catch {
-    toast("翻译或总结模型连接失败，已保留原始转写");
+    // A bad key fails every line; show the toast at most every 10 s instead of once per sentence.
+    if (type === "summary" || Date.now() - lastModelErrorToast > 10000) {
+      lastModelErrorToast = Date.now();
+      toast("翻译或总结模型连接失败，已保留原始转写");
+    }
     return "";
   }
 }
 
-async function addLine(text, translation = "", speaker = activeSpeaker, time = stamp()) {
+// Adds a committed line immediately. Translation runs in the background (bounded
+// concurrency) and patches the line when it returns; the returned promise
+// resolves once that is done, but callers on hot paths should not await it.
+function addLine(text, translation = "", speaker = activeSpeaker, time = stamp()) {
   const cleaned = String(text || "").trim();
-  if (!cleaned) return;
-  const item = { time, text: cleaned, translation, speaker };
+  if (!cleaned) return Promise.resolve();
+  const item = { id: nextLineId++, time, text: cleaned, translation, speaker };
   lines.push(item);
-  render();
-  if (!translation && config.key && $("#targetLang").value !== "off") {
+  appendLineElement(item);
+  if (translation || !textModelReady() || $("#targetLang").value === "off") return Promise.resolve();
+  const generation = sessionGeneration;
+  const task = translationLimiter(async () => {
+    if (generation !== sessionGeneration) return; // transcript was cleared meanwhile
     const result = await modelTask("translate", item.text);
+    if (!result || generation !== sessionGeneration) return;
     item.translation = result;
-    render();
-  }
+    updateLineElement(item);
+  });
+  return task;
 }
 
 function setupNativeRecognition() {
@@ -430,7 +568,8 @@ function setupNativeRecognition() {
       if (event.results[index].isFinal) addLine(text);
       else interim += text;
     }
-    render(interim);
+    // Finals can arrive after stop(); never resurrect the interim row then.
+    setInterim(recording ? interim : "");
   };
   instance.onerror = (event) => {
     if (event.error === "aborted" || event.error === "no-speech") return;
@@ -439,11 +578,29 @@ function setupNativeRecognition() {
     if (fatal && recording) stopRecording();
   };
   instance.onend = () => {
-    if (recording && recognitionMode === "browser") {
-      try { instance.start(); } catch { /* already starting */ }
+    if (recording && recognitionMode === "browser" && recognition === instance) {
+      // Chrome ends sessions after silence or ~60 s; restart, with a short delay to avoid a hot loop.
+      window.setTimeout(() => {
+        if (!recording || recognitionMode !== "browser" || recognition !== instance) return;
+        try { instance.start(); } catch { /* already starting */ }
+      }, 150);
+      return;
     }
+    instance.onend = null;
+    instance.__ended = true;
+    instance.__resolveEnded?.();
   };
   return instance;
+}
+
+// After stop(), engines still deliver the last final result before "end".
+// Wait for it (bounded) so the summary includes the last sentence.
+function waitForRecognitionEnd(instance) {
+  if (!instance || instance.__ended) return Promise.resolve();
+  return Promise.race([
+    new Promise((resolve) => { instance.__resolveEnded = resolve; }),
+    sleep(TUNING.recognitionEndGraceMs),
+  ]);
 }
 
 function preferredAudioType() {
@@ -457,40 +614,94 @@ function audioFilename(type) {
   return "segment.webm";
 }
 
+class TranscriptionError extends Error {
+  constructor(message, { fatal = false, retriable = false } = {}) {
+    super(message);
+    this.fatal = fatal;
+    this.retriable = retriable;
+  }
+}
+
+async function requestTranscription(blob) {
+  const form = new FormData();
+  form.append("file", blob, audioFilename(blob.type));
+  form.append("provider", speechConfig.provider);
+  form.append("model", speechConfig.model);
+  form.append("language", $("#sourceLang").value.startsWith("zh") ? "zh" : "en");
+  let response;
+  try {
+    response = await fetchWithTimeout("/api/transcribe", {
+      method: "POST",
+      headers: { "x-transcription-api-key": speechConfig.key },
+      body: form,
+    }, TUNING.transcribeTimeoutMs);
+  } catch (error) {
+    throw new TranscriptionError(error?.name === "AbortError" ? "语音服务响应超时" : "网络连接中断", { retriable: true });
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const fatal = response.status === 401 || response.status === 403 || data.fatal === true;
+    const retriable = !fatal && (response.status === 429 || response.status >= 500);
+    throw new TranscriptionError(data.error || "语音服务返回错误", { fatal, retriable });
+  }
+  return typeof data.text === "string" ? data.text : "";
+}
+
+// Runs serially on transcriptionQueue. One transient failure (timeout, 429, 5xx)
+// no longer disables cloud transcription for the rest of the session: it is
+// retried once, then skipped; only auth/config errors or repeated failures stop.
 async function transcribeAudio(blob, capturedAt) {
   if (speechConfig.failed || blob.size < 900) return;
   $("#recorder").classList.add("transcribing");
   try {
-    const form = new FormData();
-    form.append("file", blob, audioFilename(blob.type));
-    form.append("provider", speechConfig.provider);
-    form.append("model", speechConfig.model);
-    form.append("language", $("#sourceLang").value.startsWith("zh") ? "zh" : "en");
-    const response = await fetch("/api/transcribe", {
-      method: "POST",
-      headers: { "x-transcription-api-key": speechConfig.key },
-      body: form,
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "语音服务返回错误");
-    await addLine(data.text, "", activeSpeaker, capturedAt);
+    let text = "";
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        text = await requestTranscription(blob);
+        break;
+      } catch (error) {
+        if (error.retriable && attempt === 0 && !speechConfig.failed) {
+          await sleep(TUNING.retryDelayMs);
+          continue;
+        }
+        throw error;
+      }
+    }
+    cloudFailureStreak = 0;
+    addLine(text, "", activeSpeaker, capturedAt); // translation continues in the background
   } catch (error) {
-    speechConfig.failed = true;
-    $("#statusText").textContent = "语音识别连接失败";
-    $("#statusSub").textContent = error.message || "请检查语音 API Key 和模型设置";
-    toast("云端识别失败，请检查 API Key 与模型");
+    cloudFailureStreak += 1;
+    const fatal = !(error instanceof TranscriptionError) || error.fatal || cloudFailureStreak >= TUNING.maxCloudFailures;
+    if (fatal) {
+      failCloudTranscription(error?.message);
+    } else {
+      toast(t("一段语音识别失败，已跳过并继续录音", "One segment failed to transcribe; recording continues."));
+    }
   } finally {
     $("#recorder").classList.remove("transcribing");
   }
 }
 
+function failCloudTranscription(message) {
+  if (speechConfig.failed) return;
+  speechConfig.failed = true;
+  toast(t("云端识别失败，请检查 API Key 与模型", "Cloud transcription failed. Check the API key and model."));
+  // Stop outside the queue task (stopRecording waits for the queue), then show the reason.
+  window.setTimeout(async () => {
+    await stopRecording();
+    $("#statusText").textContent = t("语音识别连接失败", "Speech recognition failed");
+    $("#statusSub").textContent = message || t("请检查语音 API Key 和模型设置", "Check the speech API key and model settings");
+  }, 0);
+}
+
 function startCloudSegment() {
-  if (!recording || recognitionMode !== "cloud" || !mediaStream) return;
+  if (!recording || recognitionMode !== "cloud" || !mediaStream || speechConfig.failed) return;
   const chunks = [];
   const capturedAt = stamp();
   const mimeType = preferredAudioType();
+  let recorder;
   try {
-    mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+    recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
   } catch {
     speechConfig.failed = true;
     $("#statusText").textContent = "无法创建录音";
@@ -498,35 +709,63 @@ function startCloudSegment() {
     toast("当前浏览器无法创建录音文件");
     return;
   }
-  mediaRecorder.ondataavailable = (event) => {
+  mediaRecorder = recorder;
+  let resolveStopped;
+  const stopped = new Promise((resolve) => { resolveStopped = resolve; });
+  recorder.__stopped = stopped;
+  recorder.ondataavailable = (event) => {
     if (event.data?.size) chunks.push(event.data);
   };
-  mediaRecorder.onerror = () => {
-    speechConfig.failed = true;
-    toast("录音出现错误，请重新开始");
+  recorder.onerror = () => {
+    toast(t("录音出现错误，请重新开始", "Recording error. Please start again."));
+    if (recording) stopRecording();
   };
-  mediaRecorder.onstop = () => {
+  recorder.onstop = () => {
     window.clearTimeout(segmentTimer);
-    const blob = new Blob(chunks, { type: mediaRecorder?.mimeType || mimeType || "audio/webm" });
+    // Use this recorder's own type; the global may already point at the next segment.
+    const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
+    chunks.length = 0;
+    if (mediaRecorder === recorder) mediaRecorder = null;
+    if (pendingSegmentStop === stopped) pendingSegmentStop = null;
     if (recording && recognitionMode === "cloud") startCloudSegment();
     transcriptionQueue = transcriptionQueue.then(() => transcribeAudio(blob, capturedAt));
-    if (!recording && finishCloudRecording) {
-      const resolve = finishCloudRecording;
-      finishCloudRecording = null;
-      transcriptionQueue.finally(resolve);
-    }
+    resolveStopped();
   };
-  mediaRecorder.start();
+  recorder.start();
   segmentTimer = window.setTimeout(() => {
-    if (mediaRecorder?.state === "recording") mediaRecorder.stop();
-  }, 6000);
+    if (recorder.state === "recording") {
+      pendingSegmentStop = stopped;
+      recorder.stop();
+    }
+  }, TUNING.segmentMs);
 }
 
+// Guards the async start/stop transitions: a second click while getUserMedia is
+// pending, or while the previous session is still flushing, used to start a
+// second session whose stream the old stop() then killed.
+let transitioning = false;
+
 async function toggleRecord() {
+  if (transitioning) return;
   if (recording) {
     await stopRecording();
     return;
   }
+  transitioning = true;
+  try {
+    await startRecording();
+  } finally {
+    transitioning = false;
+  }
+}
+
+function handleTrackEnded() {
+  if (!recording) return;
+  toast(t("麦克风已断开，录音已停止", "Microphone disconnected; recording stopped."));
+  stopRecording();
+}
+
+async function startRecording() {
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     toast(t("当前页面无法使用麦克风，请使用 HTTPS 并允许麦克风权限", "Microphone access is unavailable. Use HTTPS and allow microphone permission."));
     return;
@@ -546,6 +785,7 @@ async function toggleRecord() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
     mediaStream = stream;
+    stream.getAudioTracks().forEach((track) => track.addEventListener("ended", handleTrackEnded));
     await refreshMicrophones();
     startAudioMeter(stream);
     if (useNative) {
@@ -578,7 +818,7 @@ async function toggleRecord() {
 function startSession(statusDetail) {
   recording = true;
   startTime = Date.now();
-  $("#timer").textContent = "00:00";
+  $("#timer").textContent = stamp();
   $("#recorder").classList.add("recording");
   $("#statusText").textContent = t("正在聆听", "Listening");
   $("#statusSub").textContent = statusDetail;
@@ -587,39 +827,63 @@ function startSession(statusDetail) {
 }
 
 async function stopRecording() {
-  if (!recording) return;
+  if (!recording || transitioning) return;
+  transitioning = true;
+  try {
+    await finishRecording();
+  } finally {
+    transitioning = false;
+  }
+  if (lines.length) await summarize();
+}
+
+async function finishRecording() {
   recording = false;
+  elapsedOffset += Math.max(0, Date.now() - startTime);
   window.clearInterval(tick);
   window.clearInterval(demoTimer);
   window.clearTimeout(segmentTimer);
   window.clearTimeout(soundWatchdog);
   window.clearTimeout(recognitionWatchdog);
-  try { recognition?.stop(); } catch { /* already stopped */ }
+  const endingRecognition = recognition;
+  try { endingRecognition?.stop(); } catch { /* already stopped */ }
 
-  if (recognitionMode === "cloud" && mediaRecorder?.state === "recording") {
-    await new Promise((resolve) => {
-      finishCloudRecording = resolve;
-      mediaRecorder.stop();
-    });
-  } else {
-    await transcriptionQueue;
+  if (recognitionMode === "cloud") {
+    // A segment may be between stop() and its onstop event; let it enqueue first.
+    if (pendingSegmentStop) await pendingSegmentStop;
+    const current = mediaRecorder;
+    if (current?.state === "recording") {
+      current.stop();
+      await current.__stopped;
+    }
+  } else if (recognitionMode === "browser") {
+    await waitForRecognitionEnd(endingRecognition);
   }
-  mediaStream?.getTracks().forEach((track) => track.stop());
+  await transcriptionQueue;
+  if (recognition === endingRecognition) recognition = null;
+  mediaStream?.getTracks().forEach((track) => {
+    track.removeEventListener("ended", handleTrackEnded);
+    track.stop();
+  });
   stopAudioMeter();
   mediaStream = null;
   mediaRecorder = null;
+  pendingSegmentStop = null;
   recognitionMode = "";
+  setInterim("");
 
+  $("#timer").textContent = stamp();
   $("#recorder").classList.remove("recording", "transcribing");
   $("#statusText").textContent = lines.length ? t("转写已完成", "Transcription complete") : t("没有识别到语音", "No speech recognized");
   $("#statusSub").textContent = lines.length ? t(`共记录 ${lines.length} 段内容`, `${lines.length} segments captured`) : t("请运行麦克风测试，或检查云端语音 API 设置", "Run the microphone test or check the cloud speech API settings");
   $("#recordLabel").textContent = t("继续录音", "Record again");
-  if (lines.length) await summarize();
 }
 
 async function summarize() {
+  // Only the newest summary may write to the panel (an older, slower one used to overwrite it).
+  const generation = ++summaryGeneration;
   const all = lines.map((line) => `说话人 ${line.speaker}：${line.text}`).join("\n");
-  if (!config.key && config.provider !== "ollama") {
+  if (!textModelReady()) {
     $("#summaryTitle").textContent = "转写已完成";
     $("#summaryText").className = "placeholder";
     $("#summaryText").textContent = "如需自动生成摘要，请在模型设置中连接 DeepSeek、Groq 或其他文本模型。";
@@ -628,6 +892,7 @@ async function summarize() {
     $("#summaryText").className = "placeholder";
     $("#summaryText").textContent = "正在按发言人提炼本次会话的重点与行动项。";
     const summary = await modelTask("summary", all);
+    if (generation !== summaryGeneration) return;
     $("#summaryTitle").textContent = summary ? "本次会话摘要" : "摘要生成失败";
     $("#summaryText").className = summary ? "" : "placeholder";
     $("#summaryText").textContent = summary || "原始转写已保留，请检查文本模型设置后重试。";
@@ -636,10 +901,17 @@ async function summarize() {
   $("#chips").innerHTML = `<span class="chip">已完成</span><span class="chip">${speakers} 位说话人</span><span class="chip">${lines.length} 段内容</span>`;
 }
 
-function runDemo() {
-  if (recording) return;
+function resetTranscript() {
+  sessionGeneration += 1;
+  summaryGeneration += 1;
+  elapsedOffset = 0;
   lines = [];
   render();
+}
+
+function runDemo() {
+  if (recording || transitioning) return;
+  resetTranscript();
   recognitionMode = "demo";
   startSession("演示字幕生成中");
   const samples = $("#sourceLang").value.startsWith("zh") ? [
@@ -771,13 +1043,14 @@ $("#uiLangBtn").onclick = () => { uiLanguage = uiLanguage === "zh" ? "en" : "zh"
 document.querySelectorAll("[data-speaker]").forEach((button) => { button.onclick = () => selectSpeaker(Number(button.dataset.speaker)); });
 $("#addSpeaker").onclick = () => {
   speakerCount += 1;
+  const number = speakerCount; // capture: speakerCount keeps changing as more speakers are added
   const button = document.createElement("button");
   button.className = "speakerbtn";
-  button.dataset.speaker = speakerCount;
-  button.textContent = `${t("说话人", "Speaker")} ${speakerCount}`;
-  button.onclick = () => selectSpeaker(speakerCount);
+  button.dataset.speaker = number;
+  button.textContent = `${t("说话人", "Speaker")} ${number}`;
+  button.onclick = () => selectSpeaker(number);
   $("#addSpeaker").before(button);
-  selectSpeaker(speakerCount);
+  selectSpeaker(number);
 };
 document.querySelectorAll(".provider-card").forEach((button) => { button.onclick = () => chooseProvider(button.dataset.provider); });
 $("#speechProvider").onchange = (event) => chooseSpeechProvider(event.target.value);
