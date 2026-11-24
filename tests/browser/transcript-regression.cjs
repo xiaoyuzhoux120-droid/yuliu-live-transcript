@@ -1,7 +1,7 @@
 // Browser regression tests for public/transcript.js (no network, no real audio, no paid APIs).
 //
 //   npm i --no-save playwright && npx playwright install chromium   # once
-//   FAST=1 node tests/browser/transcript-regression.cjs              # all tests, shortened timings
+//   node tests/browser/transcript-regression.cjs --fast              # all tests, shortened timings (or FAST=1)
 //   node tests/browser/transcript-regression.cjs [testName...]       # default timings
 //
 // Mocks /api/transcribe, the chat-completions endpoint and SpeechRecognition;
@@ -12,7 +12,7 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "../..");
-const args = process.argv.slice(2);
+const args = process.argv.slice(2).filter((arg) => arg !== "--fast");
 const custom = args.length >= 2 && args[0].endsWith(".html");
 const htmlPath = custom ? args[0] : path.join(root, "app/app/transcript.html");
 const jsPath = custom ? args[1] : path.join(root, "public/transcript.js");
@@ -20,7 +20,7 @@ const only = custom ? args.slice(2) : args;
 const ORIGIN = "http://localhost:4173";
 const html = fs.readFileSync(htmlPath, "utf8");
 const js = fs.readFileSync(jsPath, "utf8");
-const FAST = process.env.FAST === "1";
+const FAST = process.env.FAST === "1" || process.argv.includes("--fast");
 
 const fakeSR = `
 (() => {

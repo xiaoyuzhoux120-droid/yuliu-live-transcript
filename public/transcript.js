@@ -495,7 +495,8 @@ function createLineElement(line) {
 }
 
 function lineElementFor(line) {
-  return $("#transcript").querySelector(`.line[data-line-id="${CSS.escape(String(line.id))}"]`);
+  const id = String(line.id); // ids from local history are user data: compare, don't build a selector
+  return Array.from($("#transcript").children).find((element) => element.dataset.lineId === id) || null;
 }
 
 function isNearBottom(box) {
