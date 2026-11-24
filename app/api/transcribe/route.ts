@@ -35,6 +35,7 @@ export async function POST(request: Request) {
   const providerName = input.get("provider");
   const model = input.get("model");
   const language = input.get("language");
+  const prompt = input.get("prompt");
   const file = input.get("file");
   if (providerName !== "openai" && providerName !== "groq") return json({ error: "不支持的语音服务" }, 400);
   if (typeof model !== "string" || !providers[providerName].models.has(model)) return json({ error: "不支持的语音模型" }, 400);
@@ -45,6 +46,8 @@ export async function POST(request: Request) {
   outbound.append("model", model);
   outbound.append("response_format", "json");
   if (language === "zh" || language === "en") outbound.append("language", language);
+  // 上下文提示：术语表 + 上一段尾部，提升术语与中英混说的一致性（whisper-1 仅使用约 224 token）
+  if (typeof prompt === "string" && prompt.trim()) outbound.append("prompt", prompt.trim().slice(0, 800));
 
   let response: Response;
   try {
