@@ -36,9 +36,10 @@ export function loadWorkspace(options: WorkspaceOptions = {}) {
   const window = dom.window as unknown as Window & typeof globalThis & Record<string, unknown>;
   const recognitions: FakeRecognition[] = [];
   const tracksStopped = { count: 0 };
-  const getUserMedia = vi.fn(async () => ({
-    getTracks: () => [{ stop: () => { tracksStopped.count += 1; } }],
-  }));
+  const getUserMedia = vi.fn(async () => {
+    const track = { kind: "audio", readyState: "live", stop: () => { tracksStopped.count += 1; }, addEventListener: () => {}, removeEventListener: () => {} };
+    return { getTracks: () => [track], getAudioTracks: () => [track] };
+  });
 
   Object.defineProperty(window, "isSecureContext", { value: secure, configurable: true });
   Object.defineProperty(window.navigator, "mediaDevices", {
@@ -100,6 +101,11 @@ export function loadWorkspace(options: WorkspaceOptions = {}) {
     run: <T = unknown>(expression: string) => window.eval(expression) as T,
     lines: () => window.eval("lines") as Array<{ time: string; text: string; translation: string; speaker: number }>,
     flush: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    /** Press record and wait until the session is live (independent of how many awaits start-up takes). */
+    startRecording: async () => {
+      ($("#recordBtn") as HTMLElement).click();
+      await vi.waitFor(() => { if (!window.eval("recording")) throw new Error("recording did not start"); });
+    },
     click: (selector: string) => ($(selector) as HTMLElement).click(),
     setValue: (selector: string, value: string) => { ($(selector) as HTMLInputElement).value = value; },
   };

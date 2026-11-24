@@ -86,8 +86,7 @@ describe("speakers", () => {
 describe("browser (Web Speech) recognition", () => {
   it("streams interim text and commits final results", async () => {
     const ws = loadWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     expect(ws.run("recognitionMode")).toBe("browser");
     const rec = ws.recognitions[0];
     expect(rec.lang).toBe("zh-CN");
@@ -102,26 +101,23 @@ describe("browser (Web Speech) recognition", () => {
 
   it("restarts recognition when the browser ends the session mid-recording", async () => {
     const ws = loadWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     ws.recognitions[0].onend?.();
-    expect(ws.recognitions[0].started).toBe(2);
+    // Restart may be deferred briefly to avoid a hot loop.
+    await vi.waitFor(() => expect(ws.recognitions[0].started).toBe(2));
   });
 
   it("stops recording and releases the microphone on a fatal error", async () => {
     const ws = loadWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     ws.recognitions[0].onerror?.({ error: "not-allowed" });
-    await ws.flush(); await ws.flush();
-    expect(ws.run("recording")).toBe(false);
-    expect(ws.tracksStopped.count).toBe(1);
+    await vi.waitFor(() => expect(ws.run("recording")).toBe(false));
+    await vi.waitFor(() => expect(ws.tracksStopped.count).toBe(1));
   });
 
   it("ignores benign no-speech errors", async () => {
     const ws = loadWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     ws.recognitions[0].onerror?.({ error: "no-speech" });
     expect(ws.run("recording")).toBe(true);
   });
@@ -149,8 +145,7 @@ describe("cloud recognition (mocked /api/transcribe)", () => {
 
   it("uploads each segment to the same-origin proxy with the key in a header", async () => {
     const ws = cloudWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     expect(ws.run("recognitionMode")).toBe("cloud");
     ws.recorders[0].stop(); // simulate the 6s segment boundary
     await vi.waitFor(() => expect(ws.lines()).toHaveLength(1));
@@ -166,8 +161,7 @@ describe("cloud recognition (mocked /api/transcribe)", () => {
 
   it("drains the final segment on stop and then releases the mic", async () => {
     const ws = cloudWorkspace();
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     await ws.run("stopRecording()");
     expect(ws.lines()).toHaveLength(1);
     expect(ws.tracksStopped.count).toBe(1);
@@ -176,8 +170,7 @@ describe("cloud recognition (mocked /api/transcribe)", () => {
 
   it("surfaces upstream errors and stops uploading further segments", async () => {
     const ws = cloudWorkspace(async () => new Response(JSON.stringify({ error: "Incorrect API key" }), { status: 401 }));
-    ws.click("#recordBtn");
-    await ws.flush(); await ws.flush();
+    await ws.startRecording();
     ws.recorders[0].stop();
     await vi.waitFor(() => expect(ws.$("#statusSub")?.textContent).toBe("Incorrect API key"));
     ws.recorders[1].stop();
