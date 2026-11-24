@@ -1,0 +1,58 @@
+{
+  "env": "Chromium (Playwright 1.63.0), linux/x64, Node v22.23.5",
+  "baseUrl": "http://localhost:5173",
+  "loadMs": 171,
+  "nav": {
+    "domContentLoaded": 163,
+    "htmlBytes": 33519,
+    "scriptBytes": 37645
+  },
+  "rows": [
+    {
+      "size": 100,
+      "renderMedian": 9.70000000006985,
+      "renderP95": 12.199999999953434,
+      "interimMedian": 9.800000000046566,
+      "interimP95": 11,
+      "domNodes": 887,
+      "heapMB": 0.7606544494628906
+    },
+    {
+      "size": 500,
+      "renderMedian": 50.59999999997672,
+      "renderP95": 71.29999999993015,
+      "interimMedian": 42.800000000046566,
+      "interimP95": 66.29999999993015,
+      "domNodes": 3687,
+      "heapMB": 0.8317489624023438
+    },
+    {
+      "size": 1000,
+      "renderMedian": 93.29999999993015,
+      "renderP95": 145.59999999997672,
+      "interimMedian": 85,
+      "interimP95": 113,
+      "domNodes": 7187,
+      "heapMB": 0.8553390502929688
+    },
+    {
+      "size": 2000,
+      "renderMedian": 179.29999999993015,
+      "renderP95": 239.59999999997672,
+      "interimMedian": 178.19999999995343,
+      "interimP95": 263.4000000000233,
+      "domNodes": 14187,
+      "heapMB": 0.8885917663574219
+    },
+    {
+      "size": 5000,
+      "renderMedian": 451.70000000006985,
+      "renderP95": 622.5,
+      "interimMedian": 413.4000000000233,
+      "interimP95": 587.1999999999534,
+      "domNodes": 35187,
+      "heapMB": 0.9829559326171875
+    }
+  ],
+  "sessionMs": 164670.5
+}
