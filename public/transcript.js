@@ -23,13 +23,45 @@ let detectedSound = false;
 let soundWatchdog = null;
 let recognitionWatchdog = null;
 let micTestUrl = "";
+let lastSummary = null;
 
 const config = {
   key: "",
   endpoint: "https://api.deepseek.com/chat/completions",
   model: "deepseek-flash",
+  defaultModel: "deepseek-flash",
   provider: "deepseek",
+  mode: "economy",
+  summaryModel: "",
+  glossary: "",
 };
+
+const AI = window.YuliuAI;
+const usageMeter = new AI.UsageMeter();
+let lastModelErrorToast = 0;
+
+function textModelConfig() {
+  return { ...config, target: $("#targetLang").value, summaryLanguage: "auto" };
+}
+
+function reportModelError(error) {
+  // 同一类失败 20 秒内只提示一次，避免每句翻译都弹出错误。
+  if (Date.now() - lastModelErrorToast < 20000) return;
+  lastModelErrorToast = Date.now();
+  const auth = error?.status === 401 || error?.status === 403;
+  toast(auth ? t("文本模型 API Key 无效，已保留原始转写", "Text model API key rejected; original transcript kept") : t("翻译或总结模型连接失败，已保留原始转写", "Translation or summary model failed; original transcript kept"));
+}
+
+const translator = new AI.Translator({
+  getConfig: textModelConfig,
+  meter: usageMeter,
+  onTranslated: (item, translation) => {
+    item.translation = translation;
+    render();
+  },
+  onError: reportModelError,
+});
+const summarizer = new AI.Summarizer({ meter: usageMeter });
 
 const speechConfig = {
   mode: "auto",
@@ -180,8 +212,14 @@ function applyUiLanguage() {
   const notes = document.querySelectorAll(".provider-note");
   if (notes[0]) notes[0].textContent = t("ChatGPT 登录只用于账号验证，不包含 OpenAI API 额度。云端识别约每 6 秒更新一次字幕。", "ChatGPT sign-in verifies your account; it does not include OpenAI API credits. Cloud captions update about every 6 seconds.");
   const textLabels = document.querySelectorAll(".dialog > .field label, .model-row label");
-  const textLabelPairs = [["Chat Completions 地址", "Chat Completions endpoint"], ["模型名称", "Model name"], ["API Key", "API key"]];
+  const textLabelPairs = [["Chat Completions 地址", "Chat Completions endpoint"], ["模型名称", "Model name"], ["API Key", "API key"], ["运行模式", "Run mode"], ["总结模型（可选）", "Summary model (optional)"], ["术语表（可选）", "Glossary (optional)"]];
   textLabels.forEach((label, index) => { if (textLabelPairs[index]) label.textContent = t(...textLabelPairs[index]); });
+  if ($("#aiMode")) {
+    $("#aiMode").options[0].text = t("省钱模式：合并翻译请求、关闭思考", "Economy: batched translation, no reasoning");
+    $("#aiMode").options[1].text = t("高质量模式：逐句带上文翻译、强模型总结", "Quality: per-line contextual translation, stronger summary model");
+    $("#summaryModel").placeholder = t("留空则按模式自动选择", "Leave empty to pick by mode");
+    $("#glossary").placeholder = t("每行一条，例如：语流 = Yuliu；OKR = OKR", "One per line, e.g. 语流 = Yuliu");
+  }
   if (notes[1]) notes[1].textContent = uiLanguage === "zh" ? providers[config.provider].note : "Connect any OpenAI-compatible text model for translation and meeting summaries.";
   $("#endpointHint").textContent = uiLanguage === "zh" ? providers[config.provider].hint : "OpenAI-compatible text model endpoint";
   $("#speechKey").placeholder = uiLanguage === "zh" ? speechProviders[speechConfig.provider].placeholder : `Enter ${speechProviders[speechConfig.provider].name} API key`;
@@ -367,48 +405,13 @@ function escapeHtml(value) {
   })[character]);
 }
 
-async function modelTask(type, text) {
-  if (!config.key && config.provider !== "ollama") return "";
-  const target = $("#targetLang").value === "zh" ? "中文" : "English";
-  const prompts = {
-    translate: `将以下内容自然地翻译成${target}，只输出译文：`,
-    summary: "总结以下会议内容。用与内容相同的主要语言输出：1段简短摘要、3个关键点、如有则列出行动项，并保留说话人归属。",
-  };
-  try {
-    const headers = { "Content-Type": "application/json" };
-    if (config.key) headers.Authorization = `Bearer ${config.key}`;
-    const response = await fetch(config.endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: config.model,
-        messages: [
-          { role: "system", content: "你是专业的中英文会议记录助手。准确、简洁，不虚构。" },
-          { role: "user", content: `${prompts[type]}\n\n${text}` },
-        ],
-        temperature: 0.2,
-      }),
-    });
-    if (!response.ok) throw new Error();
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || "";
-  } catch {
-    toast("翻译或总结模型连接失败，已保留原始转写");
-    return "";
-  }
-}
-
 async function addLine(text, translation = "", speaker = activeSpeaker, time = stamp()) {
   const cleaned = String(text || "").trim();
   if (!cleaned) return;
   const item = { time, text: cleaned, translation, speaker };
   lines.push(item);
   render();
-  if (!translation && config.key && $("#targetLang").value !== "off") {
-    const result = await modelTask("translate", item.text);
-    item.translation = result;
-    render();
-  }
+  if (!translation) translator.enqueue(item);
 }
 
 function setupNativeRecognition() {
@@ -609,12 +612,27 @@ async function stopRecording() {
   $("#statusText").textContent = lines.length ? t("转写已完成", "Transcription complete") : t("没有识别到语音", "No speech recognized");
   $("#statusSub").textContent = lines.length ? t(`共记录 ${lines.length} 段内容`, `${lines.length} segments captured`) : t("请运行麦克风测试，或检查云端语音 API 设置", "Run the microphone test or check the cloud speech API settings");
   $("#recordLabel").textContent = t("继续录音", "Record again");
+  await translator.flush();
   if (lines.length) await summarize();
 }
 
+function usageLabel() {
+  const usage = usageMeter.snapshot();
+  if (!usage.requests) return "";
+  const tokens = usage.totalTokens >= 1000 ? `${(usage.totalTokens / 1000).toFixed(1)}k` : String(usage.totalTokens);
+  const cost = usage.costUsd === null ? "" : ` · ≈$${usage.costUsd < 0.01 ? usage.costUsd.toFixed(4) : usage.costUsd.toFixed(3)}`;
+  return `${usage.requests} ${t("次请求", "requests")} · ${tokens} tokens${cost}`;
+}
+
+function renderSummary(summary) {
+  const list = (title, items) => (items.length ? `<div class="summary-block"><strong>${escapeHtml(title)}</strong><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : "");
+  const actions = summary.action_items.map((item) => `${item.task}（${t("负责人", "Owner")}：${item.owner}；${t("期限", "Due")}：${item.due}）`);
+  return `${summary.summary ? `<p>${escapeHtml(summary.summary)}</p>` : ""}${list(t("核心结论", "Key points"), summary.key_points)}${list(t("关键决定", "Decisions"), summary.decisions)}${list(t("行动项", "Action items"), actions)}${list(t("待定问题", "Open questions"), summary.open_questions)}`;
+}
+
 async function summarize() {
-  const all = lines.map((line) => `说话人 ${line.speaker}：${line.text}`).join("\n");
-  if (!config.key && config.provider !== "ollama") {
+  const textConfig = textModelConfig();
+  if (!AI.canUseTextModel(textConfig)) {
     $("#summaryTitle").textContent = "转写已完成";
     $("#summaryText").className = "placeholder";
     $("#summaryText").textContent = "如需自动生成摘要，请在模型设置中连接 DeepSeek、Groq 或其他文本模型。";
@@ -622,18 +640,27 @@ async function summarize() {
     $("#summaryTitle").textContent = "正在整理…";
     $("#summaryText").className = "placeholder";
     $("#summaryText").textContent = "正在按发言人提炼本次会话的重点与行动项。";
-    const summary = await modelTask("summary", all);
-    $("#summaryTitle").textContent = summary ? "本次会话摘要" : "摘要生成失败";
-    $("#summaryText").className = summary ? "" : "placeholder";
-    $("#summaryText").textContent = summary || "原始转写已保留，请检查文本模型设置后重试。";
+    let summary = null;
+    try {
+      summary = await summarizer.summarize(textConfig, lines);
+    } catch (error) {
+      reportModelError(error);
+    }
+    lastSummary = summary;
+    $("#summaryTitle").textContent = summary ? (summary.title || "本次会话摘要") : "摘要生成失败";
+    $("#summaryText").className = summary ? "summary-rich" : "placeholder";
+    if (summary) $("#summaryText").innerHTML = renderSummary(summary);
+    else $("#summaryText").textContent = "原始转写已保留，请检查文本模型设置后重试。";
   }
   const speakers = new Set(lines.map((line) => line.speaker)).size;
-  $("#chips").innerHTML = `<span class="chip">已完成</span><span class="chip">${speakers} 位说话人</span><span class="chip">${lines.length} 段内容</span>`;
+  const usage = usageLabel();
+  $("#chips").innerHTML = `<span class="chip">已完成</span><span class="chip">${speakers} 位说话人</span><span class="chip">${lines.length} 段内容</span>${usage ? `<span class="chip" title="${t("本页累计文本模型用量（估算）", "Estimated text-model usage on this page")}">${escapeHtml(usage)}</span>` : ""}`;
 }
 
 function runDemo() {
   if (recording) return;
   lines = [];
+  translator.reset();
   render();
   recognitionMode = "demo";
   startSession("演示字幕生成中");
@@ -665,6 +692,7 @@ function chooseProvider(id) {
   document.querySelectorAll(".provider-card").forEach((button) => button.classList.toggle("active", button.dataset.provider === id));
   $("#endpoint").value = provider.endpoint;
   $("#model").value = provider.model;
+  config.defaultModel = provider.model;
   $("#endpointHint").textContent = uiLanguage === "zh" ? provider.hint : "OpenAI-compatible text model endpoint";
   $("#providerNote").textContent = uiLanguage === "zh" ? provider.note : "Use this model for translation, cleanup, and post-meeting summaries.";
   $("#apiKey").placeholder = id === "ollama" ? t("本地模型无需填写", "No key needed for local model") : t("可稍后填写", "Optional for now");
@@ -716,6 +744,9 @@ function saveSettings() {
   config.key = $("#apiKey").value.trim();
   config.endpoint = $("#endpoint").value.trim();
   config.model = $("#model").value.trim();
+  config.mode = $("#aiMode")?.value === "quality" ? "quality" : "economy";
+  config.summaryModel = $("#summaryModel")?.value.trim() || "";
+  config.glossary = $("#glossary")?.value.trim() || "";
 
   if (!speechConfig.model) return toast(t("请填写语音模型名称", "Enter a speech model name"));
   const needsCloud = speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
@@ -724,7 +755,8 @@ function saveSettings() {
 
   speechConfig.failed = false;
   const speechName = needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
-  $("#providerBadge").textContent = config.key ? `${speechName} · ${providers[config.provider].name}` : speechName;
+  const modeName = config.mode === "quality" ? t("高质量", "Quality") : t("省钱", "Economy");
+  $("#providerBadge").textContent = AI.canUseTextModel(config) ? `${speechName} · ${providers[config.provider].name} · ${modeName}` : speechName;
   $("#modal").classList.remove("open");
   $("#statusSub").textContent = needsCloud ? t(`${speechName} 已就绪，点击开始录音`, `${speechName} is ready. Start recording.`) : t("浏览器实时识别已就绪", "Browser live recognition is ready");
   toast(t("设置已保存，可以开始录音", "Settings saved. You can start recording."));
@@ -760,7 +792,9 @@ $("#modal").onclick = (event) => { if (event.target.id === "modal") event.curren
 $("#saveBtn").onclick = saveSettings;
 $("#copyBtn").onclick = async () => {
   if (!lines.length) return toast("还没有可复制的内容");
-  await navigator.clipboard.writeText(lines.map((line) => `说话人 ${line.speaker}：${line.text}${line.translation ? `\n${line.translation}` : ""}`).join("\n\n"));
+  const transcriptText = lines.map((line) => `说话人 ${line.speaker}：${line.text}${line.translation ? `\n${line.translation}` : ""}`).join("\n\n");
+  const summaryText = AI.summaryToText(lastSummary);
+  await navigator.clipboard.writeText(summaryText ? `${summaryText}\n\n———\n\n${transcriptText}` : transcriptText);
   toast("转写内容已复制");
 };
 $("#historyBtn").onclick = () => toast("第一版暂不保存历史记录，保护本地隐私");
