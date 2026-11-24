@@ -23,6 +23,48 @@ let detectedSound = false;
 let soundWatchdog = null;
 let recognitionWatchdog = null;
 let micTestUrl = "";
+let displayStream = null;
+let captureStarting = false;
+
+function isSystemAudio() {
+  return $("#audioSource").value === "system";
+}
+
+function updateAudioSource() {
+  const system = isSystemAudio();
+  $("#audioSourceLabel").textContent = t("音频来源", "Audio source");
+  $("#audioSource").options[0].text = t("麦克风", "Microphone");
+  $("#audioSource").options[1].text = t("会议 / 系统音频", "Meeting / system audio");
+  $("#micDevice").disabled = system;
+  $("#systemAudioHint").hidden = !system;
+  $("#systemAudioHint").textContent = t("选择会议标签页并勾选“共享音频”。桌面会议请选择带音频的窗口或屏幕；若没有音频选项，请使用网页版会议。此模式只转写共享的声音，不包含你的麦克风；需要云端语音 API。画面不会上传。", "Select the meeting tab and enable Share audio. For desktop meetings, choose a window or screen with audio; if unavailable, use the web meeting. Only shared sound is transcribed, not your microphone. A cloud speech API key is required. Video is never uploaded.");
+}
+
+function releaseDisplayCapture() {
+  displayStream?.getTracks().forEach((track) => track.stop());
+  displayStream = null;
+}
+
+async function acquireAudio() {
+  if (!isSystemAudio()) return navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+  if (!navigator.mediaDevices.getDisplayMedia) throw new Error(t("此浏览器不支持共享音频，请在 Chrome 或 Edge 中打开", "Open this site in Chrome or Edge to share meeting audio"));
+  displayStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: { suppressLocalAudioPlayback: false },
+    systemAudio: "include",
+    selfBrowserSurface: "exclude",
+    surfaceSwitching: "exclude",
+  });
+  const tracks = displayStream.getAudioTracks();
+  if (!tracks.length) {
+    releaseDisplayCapture();
+    throw new Error(t("未共享音频。请重新选择会议标签页并勾选“共享音频”", "No audio was shared. Select the meeting tab and enable Share audio."));
+  }
+  for (const track of displayStream.getTracks()) track.addEventListener("ended", () => {
+    if (recording) stopRecording();
+  }, { once: true });
+  return new MediaStream(tracks);
+}
 
 const config = {
   key: "",
@@ -188,6 +230,7 @@ function applyUiLanguage() {
   setText("#cancelBtn", "取消", "Cancel");
   setText("#saveBtn", "保存设置", "Save settings");
   updateSpeechSupport();
+  updateAudioSource();
   refreshMicrophones();
 }
 
@@ -285,7 +328,7 @@ async function testMicrophone() {
   $("#micResult").textContent = t("请正常说话", "Speak normally");
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+    stream = await acquireAudio();
     await refreshMicrophones();
     startAudioMeter(stream);
     const chunks = [];
@@ -309,9 +352,10 @@ async function testMicrophone() {
     $("#micResult").textContent = detectedSound ? t("检测到声音，可点击回放", "Audio detected — play it back") : t("未检测到声音，请更换麦克风", "No audio detected — choose another microphone");
   } catch (error) {
     $("#micResult").className = "mic-result warn";
-    $("#micResult").textContent = error?.name === "NotAllowedError" ? t("麦克风权限被拒绝", "Microphone permission denied") : t("无法打开麦克风", "Could not open microphone");
+    $("#micResult").textContent = error?.name === "NotAllowedError" ? t("音频权限被拒绝或已取消", "Audio permission denied or cancelled") : error.message;
   } finally {
     stream?.getTracks().forEach((track) => track.stop());
+    releaseDisplayCapture();
     stopAudioMeter();
     $("#testMicBtn").disabled = false;
     $("#testMicBtn").textContent = t("测试 3 秒", "Test 3 sec");
@@ -518,6 +562,7 @@ function startCloudSegment() {
 }
 
 async function toggleRecord() {
+  if (captureStarting) return;
   if (recording) {
     await stopRecording();
     return;
@@ -528,8 +573,8 @@ async function toggleRecord() {
   }
 
   speechConfig.mode = $("#speechMode").value;
-  const useNative = speechConfig.mode === "browser" || (speechConfig.mode === "auto" && supportsNativeRecognition());
-  if (speechConfig.mode === "browser" && !supportsNativeRecognition()) {
+  const useNative = !isSystemAudio() && (speechConfig.mode === "browser" || (speechConfig.mode === "auto" && supportsNativeRecognition()));
+  if (!isSystemAudio() && speechConfig.mode === "browser" && !supportsNativeRecognition()) {
     showSpeechSetup(t("此浏览器不支持浏览器实时识别，请选择云端精准识别", "This browser does not support live recognition. Choose cloud transcription."));
     return;
   }
@@ -539,7 +584,8 @@ async function toggleRecord() {
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+    captureStarting = true;
+    const stream = await acquireAudio();
     mediaStream = stream;
     await refreshMicrophones();
     startAudioMeter(stream);
@@ -566,7 +612,10 @@ async function toggleRecord() {
     stopAudioMeter();
     mediaStream?.getTracks().forEach((track) => track.stop());
     mediaStream = null;
-    toast(error?.name === "NotAllowedError" ? t("请在浏览器设置中允许麦克风权限", "Allow microphone access in browser settings") : t("无法打开麦克风，请检查系统权限", "Could not open the microphone. Check system permission."));
+    releaseDisplayCapture();
+    toast(error?.name === "NotAllowedError" ? t("音频授权被拒绝或已取消", "Audio permission denied or cancelled") : error.message);
+  } finally {
+    captureStarting = false;
   }
 }
 
@@ -578,12 +627,17 @@ function startSession(statusDetail) {
   $("#statusText").textContent = t("正在聆听", "Listening");
   $("#statusSub").textContent = statusDetail;
   $("#recordLabel").textContent = t("结束录音", "Stop recording");
+  $("#audioSource").disabled = true;
+  $("#testMicBtn").disabled = true;
   tick = window.setInterval(() => { $("#timer").textContent = stamp(); }, 500);
 }
 
 async function stopRecording() {
   if (!recording) return;
   recording = false;
+  releaseDisplayCapture();
+  $("#audioSource").disabled = false;
+  $("#testMicBtn").disabled = false;
   window.clearInterval(tick);
   window.clearInterval(demoTimer);
   window.clearTimeout(segmentTimer);
@@ -702,7 +756,7 @@ function updateSpeechSupport(message = "") {
 
 function showSpeechSetup(message) {
   $("#modal").classList.add("open");
-  if (!supportsNativeRecognition()) $("#speechMode").value = "cloud";
+  if (!supportsNativeRecognition() || isSystemAudio()) $("#speechMode").value = "cloud";
   updateSpeechSupport(message);
   window.setTimeout(() => $("#speechKey").focus(), 50);
   toast(message);
@@ -718,7 +772,7 @@ function saveSettings() {
   config.model = $("#model").value.trim();
 
   if (!speechConfig.model) return toast(t("请填写语音模型名称", "Enter a speech model name"));
-  const needsCloud = speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
+  const needsCloud = isSystemAudio() || speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
   if (needsCloud && !speechConfig.key) return toast(t("当前识别方式需要语音 API Key", "This recognition mode requires a speech API key"));
   if (!config.endpoint || !config.model) return toast(t("请填写文本模型接口和名称", "Enter the text model endpoint and name"));
 
@@ -733,6 +787,7 @@ function saveSettings() {
 $("#recordBtn").onclick = toggleRecord;
 $("#demoBtn").onclick = runDemo;
 $("#testMicBtn").onclick = testMicrophone;
+$("#audioSource").onchange = updateAudioSource;
 $("#uiLangBtn").onclick = () => { uiLanguage = uiLanguage === "zh" ? "en" : "zh"; applyUiLanguage(); render(); };
 document.querySelectorAll("[data-speaker]").forEach((button) => { button.onclick = () => selectSpeaker(Number(button.dataset.speaker)); });
 $("#addSpeaker").onclick = () => {
