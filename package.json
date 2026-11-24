@@ -14,7 +14,9 @@
     "db:generate": "drizzle-kit generate",
     "test": "node --test tests/*.test.mjs",
     "test:e2e": "node tests/e2e/cloud-transcription.mjs && node tests/e2e/browser-recognition.mjs",
-    "bench:segmentation": "node scripts/bench/segmentation.mjs"
+    "bench:segmentation": "node scripts/bench/segmentation.mjs",
+    "bench:ai": "node tests/bench-ai-cost.mjs",
+    "test:browser": "node tests/browser-smoke.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
