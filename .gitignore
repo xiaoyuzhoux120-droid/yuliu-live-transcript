@@ -44,3 +44,9 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+
+# test output
+/test-results/
+/playwright-report/
+/blob-report/
+tsconfig.tsbuildinfo

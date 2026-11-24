@@ -2,6 +2,8 @@ import { getChatGPTUser } from "../../chatgpt-auth";
 
 export const dynamic = "force-dynamic";
 
+const UPSTREAM_TIMEOUT_MS = 40_000;
+
 const providers: Record<"openai" | "groq", { endpoint: string; models: Set<string> }> = {
   openai: {
     endpoint: "https://api.openai.com/v1/audio/transcriptions",
@@ -18,12 +20,19 @@ const providers: Record<"openai" | "groq", { endpoint: string; models: Set<strin
   },
 };
 
+const MAX_FILE_BYTES = 12 * 1024 * 1024;
+// Reject oversized bodies before buffering them; leave headroom for multipart fields.
+const MAX_REQUEST_BYTES = MAX_FILE_BYTES + 64 * 1024;
+
 export async function POST(request: Request) {
   const user = await getChatGPTUser();
   if (!user) return json({ error: "请先使用 ChatGPT 登录" }, 401);
 
   const apiKey = request.headers.get("x-transcription-api-key")?.trim();
-  if (!apiKey || apiKey.length > 512) return json({ error: "请填写有效的语音 API Key" }, 400);
+  if (!apiKey || apiKey.length > 512) return json({ error: "请填写有效的语音 API Key", fatal: true }, 400);
+
+  const declaredLength = Number(request.headers.get("content-length") ?? "0");
+  if (declaredLength > MAX_REQUEST_BYTES) return json({ error: "录音片段无效或过大" }, 413);
 
   let input: FormData;
   try {
@@ -35,16 +44,19 @@ export async function POST(request: Request) {
   const providerName = input.get("provider");
   const model = input.get("model");
   const language = input.get("language");
+  const prompt = input.get("prompt");
   const file = input.get("file");
-  if (providerName !== "openai" && providerName !== "groq") return json({ error: "不支持的语音服务" }, 400);
-  if (typeof model !== "string" || !providers[providerName].models.has(model)) return json({ error: "不支持的语音模型" }, 400);
-  if (!(file instanceof File) || file.size < 900 || file.size > 12 * 1024 * 1024) return json({ error: "录音片段无效或过大" }, 400);
+  if (providerName !== "openai" && providerName !== "groq") return json({ error: "不支持的语音服务", fatal: true }, 400);
+  if (typeof model !== "string" || !providers[providerName].models.has(model)) return json({ error: "不支持的语音模型", fatal: true }, 400);
+  if (!(file instanceof File) || file.size < 900 || file.size > MAX_FILE_BYTES) return json({ error: "录音片段无效或过大" }, 400);
 
   const outbound = new FormData();
   outbound.append("file", file, safeFilename(file));
   outbound.append("model", model);
   outbound.append("response_format", "json");
   if (language === "zh" || language === "en") outbound.append("language", language);
+  // 上下文提示：术语表 + 上一段尾部，提升术语与中英混说的一致性（whisper-1 仅使用约 224 token）
+  if (typeof prompt === "string" && prompt.trim()) outbound.append("prompt", prompt.trim().slice(0, 800));
 
   let response: Response;
   try {
@@ -52,19 +64,29 @@ export async function POST(request: Request) {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
       body: outbound,
+      // Without a bound a stalled upstream holds the request (and the client's serial queue) open.
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
-  } catch {
-    return json({ error: "暂时无法连接语音服务" }, 502);
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
+    return json({ error: timedOut ? "语音服务响应超时" : "暂时无法连接语音服务" }, timedOut ? 504 : 502);
   }
 
   const result = await response.json().catch(() => null) as { text?: unknown; error?: { message?: unknown } } | null;
   if (!response.ok) {
     const providerMessage = typeof result?.error?.message === "string" ? result.error.message : "语音服务拒绝了请求";
-    return json({ error: providerMessage.slice(0, 240) }, response.status === 401 ? 401 : 502);
+    return json({ error: providerMessage.slice(0, 240) }, upstreamErrorStatus(response.status));
   }
   if (typeof result?.text !== "string") return json({ error: "语音服务没有返回文字" }, 502);
 
   return json({ text: result.text.trim() }, 200);
+}
+
+// Keep the statuses the client acts on: 401/403 stop the session, 429 is retried,
+// everything else is reported as a transient upstream failure.
+function upstreamErrorStatus(status: number) {
+  if (status === 401 || status === 403 || status === 429) return status;
+  return 502;
 }
 
 function safeFilename(file: File) {
@@ -73,12 +95,13 @@ function safeFilename(file: File) {
   return "segment.webm";
 }
 
-function json(body: { error: string } | { text: string }, status: number) {
+function json(body: { error: string; fatal?: boolean } | { text: string }, status: number) {
   return Response.json(body, {
     status,
     headers: {
       "cache-control": "private, no-store",
       "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
     },
   });
 }
