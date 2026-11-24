@@ -20,7 +20,7 @@
     <aside class="side">
       <div class="brand"><span class="brandmark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M3 13h3l2-8 4 15 3-12 2 5h4"/></svg></span>语流</div>
       <nav class="nav"><button class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/></svg>实时转写</button><button id="historyBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>最近记录</button></nav>
-      <div class="side-note"><div class="privacy"><i></i>隐私设置</div>浏览器识别在本机完成；云端识别只会把录音片段发送到你选择的语音服务。</div>
+      <div class="side-note"><div class="privacy"><i></i>隐私设置</div>浏览器识别由浏览器厂商的语音服务处理（Chrome/Edge 会把音频发送到 Google/微软）；云端识别会经本站把约 6 秒的录音片段转发给你选择的服务。录音和转写不会保存到本站。</div>
     </aside>
     <main class="main">
       <header class="top"><div class="title"><h1>实时转写</h1><p>让每一句话都清楚、准确、有上下文。</p></div><div class="actions"><button class="ghost lang-toggle" id="uiLangBtn" type="button">English</button><button class="iconbtn" id="copyBtn" aria-label="复制转写"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><button class="ghost" id="settingsBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg><span id="providerBadge">模型设置</span></button></div></header>
@@ -41,7 +41,7 @@
   <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="dialog">
       <h2 id="modalTitle">语音与模型设置</h2>
-      <p>先选择语音转文字方式，再按需连接翻译与总结模型。密钥只在当前页面使用，不会保存到网站。</p>
+      <p>先选择语音转文字方式，再按需连接翻译与总结模型。密钥只保存在当前页面内存中，刷新即清除；语音 Key 会经本站转发给语音服务但不会被记录，文本模型 Key 由浏览器直接发送到你填写的接口。</p>
       <div class="settings-section-title">语音转文字</div>
       <div class="speech-grid">
         <div class="field"><label for="speechMode">识别方式</label><select class="select wide" id="speechMode"><option value="auto">自动选择</option><option value="browser">浏览器实时识别</option><option value="cloud">云端精准识别</option></select></div>
@@ -81,6 +81,6 @@
     $('#recordBtn').onclick=toggleRecord;$('#demoBtn').onclick=runDemo;document.querySelectorAll('[data-speaker]').forEach(b=>b.onclick=()=>selectSpeaker(Number(b.dataset.speaker)));$('#addSpeaker').onclick=()=>{speakerCount++;const b=document.createElement('button');b.className='speakerbtn';b.dataset.speaker=speakerCount;b.textContent=`说话人 ${speakerCount}`;b.onclick=()=>selectSpeaker(speakerCount);$('#addSpeaker').before(b);selectSpeaker(speakerCount)};document.querySelectorAll('.provider-card').forEach(b=>b.onclick=()=>chooseProvider(b.dataset.provider));chooseProvider('deepseek');$('#settingsBtn').onclick=()=>$('#modal').classList.add('open');$('#cancelBtn').onclick=()=>$('#modal').classList.remove('open');$('#modal').onclick=e=>{if(e.target.id==='modal')e.currentTarget.classList.remove('open')};$('#saveBtn').onclick=()=>{config.key=$('#apiKey').value.trim();config.endpoint=$('#endpoint').value.trim();config.model=$('#model').value.trim();if(!config.endpoint||!config.model)return toast('请填写接口地址和模型名称');if(!config.key&&config.provider!=='ollama')return toast('这个供应商需要 API Key');$('#providerBadge').textContent=providers[config.provider].name;$('#modal').classList.remove('open');toast(`${providers[config.provider].name} 已连接`)};$('#copyBtn').onclick=async()=>{if(!lines.length)return toast('还没有可复制的内容');await navigator.clipboard.writeText(lines.map(x=>`说话人 ${x.speaker}：${x.text}${x.translation?'\n'+x.translation:''}`).join('\n\n'));toast('转写内容已复制')};$('#historyBtn').onclick=()=>toast('第一版暂不保存历史记录，保护本地隐私');
     if(document.modelContext?.registerTool){document.modelContext.registerTool({name:'start_demo_transcription',title:'开始演示转写',description:'在页面中开始一段中英文实时转写演示。',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false,untrustedContentHint:false},execute:()=>{runDemo();return{status:'started'}}}).catch(()=>{})}
   </script>
-  <script src="/transcript.js?v=3"></script>
+  <script src="/transcript.js?v=4"></script>
 </body>
 </html>

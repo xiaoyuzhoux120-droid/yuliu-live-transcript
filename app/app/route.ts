@@ -3,6 +3,24 @@ import transcriptHtml from "./transcript.html?raw";
 
 export const dynamic = "force-dynamic";
 
+// API keys live in this page's memory, so block injected scripts and framing.
+// connect-src stays open to any https:// endpoint because users may point the
+// text model at their own OpenAI-compatible service; plain http:// is limited
+// to the local machine (Ollama). The page itself has no inline scripts.
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "media-src 'self' blob:",
+  "font-src 'self'",
+  "connect-src 'self' https: http://localhost:* http://127.0.0.1:*",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
 export async function GET() {
   const user = await requireChatGPTUser("/app");
   const displayName = escapeHtml(user.displayName);
@@ -25,6 +43,10 @@ export async function GET() {
       "cache-control": "private, no-store",
       "x-content-type-options": "nosniff",
       "referrer-policy": "strict-origin-when-cross-origin",
+      "content-security-policy": CONTENT_SECURITY_POLICY,
+      "x-frame-options": "DENY",
+      "permissions-policy": "microphone=(self), camera=(), geolocation=(), payment=(), usb=()",
+      "cross-origin-opener-policy": "same-origin",
     },
   });
 }
