@@ -9,7 +9,8 @@ import { createRequire } from 'node:module';
 const { chromium } = createRequire(import.meta.url)('playwright');
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const server = http.createServer((req, res) => {
-  const file = req.url.startsWith('/transcript.js') ? path.join(root, 'public', 'transcript.js') : path.join(root, 'app', 'app', 'transcript.html');
+  const script = req.url.match(/^\/([\w-]+\.js)/);
+  const file = script ? path.join(root, 'public', script[1]) : path.join(root, 'app', 'app', 'transcript.html');
   res.writeHead(200, { 'content-type': file.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8' });
   res.end(fs.readFileSync(file));
 });
@@ -35,7 +36,7 @@ const check = (name, ok, extra='') => { results.push(`${ok ? 'PASS' : 'FAIL'}  $
   await p.waitForTimeout(1200);
   await p.evaluate(() => stopRecording());
   // continue recording: timestamps should continue, not restart at 00:00
-  await p.evaluate(() => { elapsedBefore = 125000; recognitionMode = 'browser'; startSession('mock'); });
+  await p.evaluate(() => { elapsedOffset = 125000; recognitionMode = 'browser'; startSession('mock'); });
   await p.evaluate(async () => { await addLine('继续录音后的第三句。'); });
   const thirdTime = await p.evaluate(() => lines[2].time);
   check('Record again continues timeline', thirdTime === '02:05', `third line time=${thirdTime}`);
@@ -49,10 +50,10 @@ const check = (name, ok, extra='') => { results.push(`${ok ? 'PASS' : 'FAIL'}  $
   check('search highlights match', marks === 1, `marks=${marks}, label=${await p.textContent('#searchCount')}`);
   await p.fill('#searchInput', '');
   // 4. star + edit
-  await p.hover('.lines > .line:nth-child(1)');
-  await p.click('.lines > .line:nth-child(1) [data-action=star]');
+  await p.hover('#transcript > .line:nth-child(1)');
+  await p.click('#transcript > .line:nth-child(1) [data-action=star]');
   check('star line', await p.evaluate(() => lines[0].starred));
-  await p.click('.lines > .line:nth-child(2) [data-action=edit]');
+  await p.click('#transcript > .line:nth-child(2) [data-action=edit]');
   await p.keyboard.press('Control+A');
   await p.keyboard.type('Second line about the product roadmap.');
   await p.keyboard.press('Enter');
@@ -63,11 +64,11 @@ const check = (name, ok, extra='') => { results.push(`${ok ? 'PASS' : 'FAIL'}  $
   await p.keyboard.press('Control+A');
   await p.keyboard.type('Alice');
   await p.keyboard.press('Enter');
-  const badge = await p.textContent('.lines > .line:nth-child(2) .speaker-badge');
+  const badge = await p.textContent('#transcript > .line:nth-child(2) .speaker-badge');
   check('rename speaker updates transcript', badge === 'Alice', badge);
   // 6. scene preset
   await p.selectOption('#sceneSelect', 'class');
-  const b1 = await p.textContent('.lines > .line:nth-child(1) .speaker-badge');
+  const b1 = await p.textContent('#transcript > .line:nth-child(1) .speaker-badge');
   check('class scene labels speaker 1 as 老师', b1 === '老师', b1);
   // 7. exports
   const [dl] = await Promise.all([p.waitForEvent('download'), (async () => { await p.click('#exportBtn'); await p.click('[data-export=md]'); })()]);
@@ -99,7 +100,7 @@ const check = (name, ok, extra='') => { results.push(`${ok ? 'PASS' : 'FAIL'}  $
   // 11. scroll: user scrolled up should not be yanked to bottom
   await p.evaluate(async () => { startNewSession({ force: true }); recognitionMode='browser'; startSession('mock'); for (let i = 0; i < 40; i++) await addLine(`第 ${i} 句，测试长会议滚动行为，内容足够长以便换行显示。`); });
   await p.evaluate(() => { $('#transcript').scrollTop = 0; });
-  await p.evaluate(async () => { render('正在说的话'); await addLine('新的一句'); });
+  await p.evaluate(async () => { setInterim('正在说的话'); await addLine('新的一句'); });
   const st = await p.evaluate(() => [$('#transcript').scrollTop, $('#jumpLatest').hidden]);
   check('scrolled-up reader is not yanked to bottom; jump pill shown', st[0] === 0 && st[1] === false, JSON.stringify(st));
   // 12. perf: 2000 lines, interim updates
@@ -107,7 +108,7 @@ const check = (name, ok, extra='') => { results.push(`${ok ? 'PASS' : 'FAIL'}  $
     for (let i = 0; i < 2000; i++) lines.push({ id: 'p' + i, time: '10:00', at: 600, text: '这是一个用于性能测试的长句子，模拟两小时会议的转写内容。', translation: 'This is a long sentence for performance testing.', speaker: 1 + (i % 3), starred: false, edited: false, rev: 0 });
     render();
     const t0 = performance.now();
-    for (let i = 0; i < 100; i++) render('临时识别结果 ' + i);
+    for (let i = 0; i < 100; i++) setInterim('临时识别结果 ' + i); // interim updates only touch the interim row
     return (performance.now() - t0) / 100;
   });
   check('interim update cost with 2,000 lines', perf < 8, `${perf.toFixed(2)} ms/update`);

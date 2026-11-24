@@ -221,7 +221,7 @@ function applyUiLanguage() {
   setText(".privacy", "隐私设置", "Privacy");
   setText(".title h1", "实时转写", "Live transcript");
   setText(".title p", "让每一句话都清楚、准确、有上下文。", "Clear, accurate, contextual notes from every conversation.");
-  $("#providerBadge").textContent = speechConfig.key ? `${speechProviders[speechConfig.provider].name}${config.key ? ` · ${providers[config.provider].name}` : ""}` : t("模型设置", "Model settings");
+  updateProviderBadge();
   if (!recording) {
     setText("#statusText", lines.length ? "转写已完成" : "准备就绪", lines.length ? "Transcription complete" : "Ready");
     setText("#statusSub", lines.length ? `共记录 ${lines.length} 段内容` : (supportsNativeRecognition() ? "点击开始，允许麦克风访问" : "当前浏览器需配置云端语音识别"), lines.length ? `${lines.length} segments captured` : (supportsNativeRecognition() ? "Press start and allow microphone access" : "Cloud speech recognition is required in this browser"));
@@ -1183,6 +1183,21 @@ function checkTextEndpoint(value) {
   return t("文本模型接口只支持 https:// 或本机 http:// 地址", "Only https:// or local http:// endpoints are supported.");
 }
 
+let settingsSaved = false;
+
+function speechServiceName() {
+  const needsCloud = speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
+  return needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
+}
+
+// One source of truth for the header badge; applyUiLanguage() used to reset it to "Model settings".
+function updateProviderBadge() {
+  if (!settingsSaved) { $("#providerBadge").textContent = t("模型设置", "Model settings"); return; }
+  const modeName = config.mode === "quality" ? t("高质量", "Quality") : t("省钱", "Economy");
+  const speechName = speechServiceName();
+  $("#providerBadge").textContent = AI.canUseTextModel(config) ? `${speechName} · ${providers[config.provider].name} · ${modeName}` : speechName;
+}
+
 function saveSettings() {
   const nextSpeech = {
     mode: $("#speechMode").value,
@@ -1213,9 +1228,9 @@ function saveSettings() {
   glossary = Speech.parseGlossary(speechConfig.glossary);
 
   speechConfig.failed = false;
-  const speechName = needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
-  const modeName = config.mode === "quality" ? t("高质量", "Quality") : t("省钱", "Economy");
-  $("#providerBadge").textContent = AI.canUseTextModel(config) ? `${speechName} · ${providers[config.provider].name} · ${modeName}` : speechName;
+  settingsSaved = true;
+  const speechName = speechServiceName();
+  updateProviderBadge();
   $("#modal").classList.remove("open");
   $("#statusSub").textContent = needsCloud ? t(`${speechName} 已就绪，点击开始录音`, `${speechName} is ready. Start recording.`) : t("浏览器实时识别已就绪", "Browser live recognition is ready");
   toast(t("设置已保存，可以开始录音", "Settings saved. You can start recording."));
