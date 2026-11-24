@@ -78,7 +78,7 @@ const providers = {
     model: "qwen3:8b",
     models: ["qwen3:8b", "deepseek-r1:8b", "llama3.1:8b"],
     hint: "本机 Ollama OpenAI 兼容地址",
-    note: "模型在你的设备内运行，不需要 API Key。浏览器访问本地服务时可能需要配置 OLLAMA_ORIGINS。",
+    note: "模型在你的设备内运行，不需要 API Key。浏览器访问本地服务时需要把 OLLAMA_ORIGINS 设为本站地址，不要设为 *，否则任何网页都能调用你的本地模型。",
   },
   custom: {
     name: "自定义",
@@ -167,7 +167,7 @@ function applyUiLanguage() {
   if (insights[1]) { insights[1].querySelector("strong").textContent = t("实时翻译", "Live translation"); insights[1].querySelector("p").textContent = t("原文与译文同步对照，适合访谈与跨国会议。", "View source and translation together for interviews and global meetings."); }
   if (insights[2]) { insights[2].querySelector("strong").textContent = t("结构化总结", "Structured summary"); insights[2].querySelector("p").textContent = t("按发言人提取摘要、决定与待办事项。", "Extract summaries, decisions, and action items by speaker."); }
   setText("#modalTitle", "语音与模型设置", "Speech and model settings");
-  setText(".dialog > p", "先选择语音转文字方式，再按需连接翻译与总结模型。密钥只在当前页面使用，不会保存到网站。", "Choose speech-to-text first, then optionally connect a translation and summary model. Keys are used only on this page and are not saved.");
+  setText(".dialog > p", "先选择语音转文字方式，再按需连接翻译与总结模型。密钥只保存在当前页面内存中，刷新即清除；语音 Key 会经本站转发给语音服务但不会被记录，文本模型 Key 由浏览器直接发送到你填写的接口。", "Choose speech-to-text first, then optionally connect a translation and summary model. Keys live only in this page's memory and are cleared on reload. The speech key is relayed through this site to the speech service without being logged; the text model key goes straight from your browser to the endpoint you enter.");
   const sectionTitles = document.querySelectorAll(".settings-section-title");
   if (sectionTitles[0]) sectionTitles[0].textContent = t("语音转文字", "Speech to text");
   if (sectionTitles[1]) sectionTitles[1].textContent = t("翻译与会后总结", "Translation and summary");
@@ -330,7 +330,7 @@ function render(interim = "") {
     <div class="line">
       <span class="stamp">${line.time}</span>
       <div>
-        <div class="utterance-head"><button class="speaker-badge s${line.speaker}" onclick="cycleSpeaker(${index})" title="${t("点按更换说话人", "Tap to change speaker")}">${t("说话人", "Speaker")} ${line.speaker}</button></div>
+        <div class="utterance-head"><button type="button" class="speaker-badge s${line.speaker}" data-cycle-speaker="${index}" title="${t("点按更换说话人", "Tap to change speaker")}">${t("说话人", "Speaker")} ${line.speaker}</button></div>
         <div class="words">${escapeHtml(line.text)}</div>
         ${line.translation ? `<div class="translation">${escapeHtml(line.translation)}</div>` : ""}
       </div>
@@ -355,7 +355,12 @@ function cycleSpeaker(index) {
   toast(t(`已改为说话人 ${lines[index].speaker}`, `Changed to Speaker ${lines[index].speaker}`));
 }
 
-window.cycleSpeaker = cycleSpeaker;
+$("#transcript").addEventListener("click", (event) => {
+  const badge = event.target.closest?.("[data-cycle-speaker]");
+  if (!badge) return;
+  const index = Number(badge.dataset.cycleSpeaker);
+  if (Number.isInteger(index) && lines[index]) cycleSpeaker(index);
+});
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, (character) => ({
@@ -708,19 +713,48 @@ function showSpeechSetup(message) {
   toast(message);
 }
 
-function saveSettings() {
-  speechConfig.mode = $("#speechMode").value;
-  speechConfig.provider = $("#speechProvider").value;
-  speechConfig.model = $("#speechModel").value.trim();
-  speechConfig.key = $("#speechKey").value.trim();
-  config.key = $("#apiKey").value.trim();
-  config.endpoint = $("#endpoint").value.trim();
-  config.model = $("#model").value.trim();
+function isLoopbackHost(hostname) {
+  return hostname === "localhost" || hostname === "127.0.0.1";
+}
 
-  if (!speechConfig.model) return toast(t("请填写语音模型名称", "Enter a speech model name"));
-  const needsCloud = speechConfig.mode === "cloud" || (speechConfig.mode === "auto" && !supportsNativeRecognition());
-  if (needsCloud && !speechConfig.key) return toast(t("当前识别方式需要语音 API Key", "This recognition mode requires a speech API key"));
-  if (!config.endpoint || !config.model) return toast(t("请填写文本模型接口和名称", "Enter the text model endpoint and name"));
+// The text-model key and transcript are sent from the browser straight to this
+// endpoint, so refuse anything that would expose them in transit.
+function checkTextEndpoint(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return t("文本模型接口地址无效，请填写完整的 https:// 地址", "The text model endpoint is not a valid URL. Enter a full https:// address.");
+  }
+  if (url.username || url.password) return t("接口地址中不能包含用户名或密码，请把密钥填在 API Key 中", "Do not put credentials in the endpoint URL. Use the API key field.");
+  if (url.protocol === "https:") return "";
+  if (url.protocol === "http:" && isLoopbackHost(url.hostname)) return "";
+  if (url.protocol === "http:") return t("非本机接口必须使用 https://，否则密钥和会议内容会以明文传输（浏览器也会拦截）", "Non-local endpoints must use https://; otherwise your key and meeting text travel in plain text (and the browser blocks it).");
+  return t("文本模型接口只支持 https:// 或本机 http:// 地址", "Only https:// or local http:// endpoints are supported.");
+}
+
+function saveSettings() {
+  const nextSpeech = {
+    mode: $("#speechMode").value,
+    provider: $("#speechProvider").value,
+    model: $("#speechModel").value.trim(),
+    key: $("#speechKey").value.trim(),
+  };
+  const nextText = {
+    key: $("#apiKey").value.trim(),
+    endpoint: $("#endpoint").value.trim(),
+    model: $("#model").value.trim(),
+  };
+
+  // Validate everything before applying, so a rejected endpoint never receives the key.
+  if (!nextSpeech.model) return toast(t("请填写语音模型名称", "Enter a speech model name"));
+  const needsCloud = nextSpeech.mode === "cloud" || (nextSpeech.mode === "auto" && !supportsNativeRecognition());
+  if (needsCloud && !nextSpeech.key) return toast(t("当前识别方式需要语音 API Key", "This recognition mode requires a speech API key"));
+  if (!nextText.endpoint || !nextText.model) return toast(t("请填写文本模型接口和名称", "Enter the text model endpoint and name"));
+  const endpointProblem = checkTextEndpoint(nextText.endpoint);
+  if (endpointProblem) return toast(endpointProblem);
+  Object.assign(speechConfig, nextSpeech);
+  Object.assign(config, nextText);
 
   speechConfig.failed = false;
   const speechName = needsCloud ? speechProviders[speechConfig.provider].name : t("浏览器语音", "Browser speech");
