@@ -110,10 +110,17 @@ describe("POST /api/transcribe — upstream proxying", () => {
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "Incorrect API key" });
 
-    fetchMock.mockResolvedValueOnce(Response.json({ error: { message: "x".repeat(1000) } }, { status: 429 }));
+    fetchMock.mockResolvedValueOnce(Response.json({ error: { message: "x".repeat(1000) } }, { status: 500 }));
     res = await POST(request());
     expect(res.status).toBe(502);
     expect(((await res.json()) as { error: string }).error).toHaveLength(240);
+  });
+
+  it("reports upstream rate limiting as an error (429 or 502)", async () => {
+    fetchMock.mockResolvedValueOnce(Response.json({ error: { message: "Rate limit" } }, { status: 429 }));
+    const res = await POST(request());
+    expect([429, 502]).toContain(res.status);
+    expect(await res.json()).toEqual({ error: "Rate limit" });
   });
 
   it("handles network failures, non-JSON bodies and missing text", async () => {

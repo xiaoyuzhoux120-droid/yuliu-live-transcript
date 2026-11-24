@@ -47,7 +47,10 @@ for (const size of SIZES) {
     const time = (fn) => { const t0 = performance.now(); fn(); void document.body.offsetHeight; return performance.now() - t0; };
     const full = []; const interim = [];
     for (let i = 0; i < runs; i += 1) full.push(time(() => render()));
-    for (let i = 0; i < runs; i += 1) interim.push(time(() => render("正在说话的内容 partial result …")));
+    // Newer builds update the interim line via setInterim() instead of a full render.
+    let setInterim; try { setInterim = scope("typeof setInterim === 'function' ? setInterim : null"); } catch { setInterim = null; }
+    const updateInterim = setInterim ? (text) => setInterim(text) : (text) => render(text);
+    for (let i = 0; i < runs; i += 1) interim.push(time(() => updateInterim(`正在说话的内容 partial result ${i} …`)));
     const median = (a) => a.sort((x, y) => x - y)[Math.floor(a.length / 2)];
     const p95 = (a) => a.sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(a.length * 0.95))];
     return {
@@ -68,11 +71,13 @@ const session = await page.evaluate(async (n) => {
   const scope = (code) => (0, eval)(code);
   scope("lines = []");
   const render = scope("render"); const lines = scope("lines");
+  const setInterim = scope("typeof setInterim === 'function' ? setInterim : null");
+  const addLine = scope("addLine");
   const t0 = performance.now();
   for (let i = 0; i < n; i += 1) {
-    for (let k = 0; k < 4; k += 1) render("partial …");
-    lines.push({ time: "00:00", text: "一句完整的话 with some English.", translation: "A complete sentence.", speaker: 1 });
-    render();
+    for (let k = 0; k < 4; k += 1) { if (setInterim) setInterim(`partial ${k}`); else render(`partial ${k}`); }
+    if (setInterim) { await addLine("一句完整的话 with some English.", "A complete sentence.", 1, "00:00"); }
+    else { lines.push({ time: "00:00", text: "一句完整的话 with some English.", translation: "A complete sentence.", speaker: 1 }); render(); }
   }
   void document.body.offsetHeight;
   return performance.now() - t0;
