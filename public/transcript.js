@@ -1016,13 +1016,14 @@ $("#uiLangBtn").onclick = () => { uiLanguage = uiLanguage === "zh" ? "en" : "zh"
 document.querySelectorAll("[data-speaker]").forEach((button) => { button.onclick = () => selectSpeaker(Number(button.dataset.speaker)); });
 $("#addSpeaker").onclick = () => {
   speakerCount += 1;
+  const number = speakerCount; // capture: speakerCount keeps changing as more speakers are added
   const button = document.createElement("button");
   button.className = "speakerbtn";
-  button.dataset.speaker = speakerCount;
-  button.textContent = `${t("说话人", "Speaker")} ${speakerCount}`;
-  button.onclick = () => selectSpeaker(speakerCount);
+  button.dataset.speaker = number;
+  button.textContent = `${t("说话人", "Speaker")} ${number}`;
+  button.onclick = () => selectSpeaker(number);
   $("#addSpeaker").before(button);
-  selectSpeaker(speakerCount);
+  selectSpeaker(number);
 };
 document.querySelectorAll(".provider-card").forEach((button) => { button.onclick = () => chooseProvider(button.dataset.provider); });
 $("#speechProvider").onchange = (event) => chooseSpeechProvider(event.target.value);

@@ -92,6 +92,15 @@ const lineTexts = (page) => page.$$eval("#transcript .line:not(.interim) .words"
 const stamps = (page) => page.$$eval("#transcript .line:not(.interim) .stamp", (els) => els.map((e) => e.textContent));
 
 const tests = {
+  async added_speaker_buttons_select_themselves({ page }) {
+    await page.click("#addSpeaker");
+    await page.click("#addSpeaker");
+    await page.click('[data-speaker="3"]');
+    const active = await page.$eval(".speakerbtn.active, [data-speaker].active", (e) => e.dataset.speaker);
+    if (active !== "3") throw new Error(`clicked Speaker 3 but Speaker ${active} is active`);
+    return "Speaker 3 selected";
+  },
+
   async double_click_start_single_session({ page }) {
     await page.evaluate(() => { document.querySelector("#recordBtn").click(); document.querySelector("#recordBtn").click(); });
     await wait(800);
