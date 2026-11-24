@@ -45,9 +45,11 @@ describe("rendering and XSS safety", () => {
   it("cycles a line's speaker through the configured speakers", async () => {
     const ws = loadWorkspace();
     await ws.run(`addLine('hello', 'x', 2, '00:00')`);
-    ws.run("cycleSpeaker(0)");
+    // Click the badge like a user (works with inline onclick or delegation).
+    const badge = () => ws.$("#transcript .line .speaker-badge") as HTMLElement;
+    badge().click();
     expect(ws.lines()[0].speaker).toBe(1);
-    ws.run("cycleSpeaker(0)");
+    badge().click();
     expect(ws.lines()[0].speaker).toBe(2);
   });
 
